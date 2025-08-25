@@ -2,9 +2,5 @@ fastapi==0.104.1
 uvicorn==0.24.0
 python-multipart==0.0.6
 pdf2image==1.16.3
-numpy==1.24.3
+pytesseract==0.3.10
 pillow==10.0.1
-easyocr==1.7.0
---find-links https://download.pytorch.org/whl/torch_stable.html
-torch==2.0.1+cpu
-torchvision==0.15.2+cpu
