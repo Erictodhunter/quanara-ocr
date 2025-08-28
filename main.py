@@ -1,7 +1,7 @@
 import pytesseract
 import pdf2image
-from PIL import Image
-from fastapi import FastAPI, File, UploadFile, HTTPException
+from PIL import Image, ImageFilter
+from fastapi import FastAPI, File, UploadFile, HTTPException, Form
 from fastapi.responses import HTMLResponse, JSONResponse, StreamingResponse
 from fastapi.middleware.cors import CORSMiddleware
 import uvicorn
@@ -12,79 +12,161 @@ import asyncio
 from datetime import datetime
 import uuid
 import time
+from difflib import SequenceMatcher
+from collections import Counter
 
 app = FastAPI(
     title="QUANARA OCR API",
-    description="Auto-detect language OCR service for PDFs and images with real-time progress tracking",
-    version="2.0.0",
+    description="Auto-detect language OCR service with multi-pass verification",
+    version="3.0.0",
     docs_url="/api/docs",
     redoc_url="/api/redoc"
 )
 
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_credentials=True, allow_methods=["*"], allow_headers=["*"])
 
-async def stream_ocr_progress(file_content: bytes, filename: str, file_id: str):
-    """Stream OCR progress in real-time with auto language detection"""
+def calculate_confidence(texts):
+    """Calculate confidence score based on text similarity"""
+    if len(texts) == 1:
+        return 100.0
+    
+    # Compare all pairs and get average similarity
+    similarities = []
+    for i in range(len(texts)):
+        for j in range(i + 1, len(texts)):
+            ratio = SequenceMatcher(None, texts[i], texts[j]).ratio()
+            similarities.append(ratio * 100)
+    
+    return sum(similarities) / len(similarities) if similarities else 100.0
+
+def get_consensus_text(texts):
+    """Get the most common text or merge similar texts"""
+    if len(texts) == 1:
+        return texts[0]
+    
+    # For character-level consensus
+    consensus = []
+    max_len = max(len(text) for text in texts)
+    
+    for i in range(max_len):
+        chars_at_position = []
+        for text in texts:
+            if i < len(text):
+                chars_at_position.append(text[i])
+        
+        if chars_at_position:
+            # Get most common character at this position
+            char_counts = Counter(chars_at_position)
+            consensus.append(char_counts.most_common(1)[0][0])
+    
+    return ''.join(consensus)
+
+async def verify_ocr_extraction(image, verification_level):
+    """Run OCR multiple times based on verification level"""
+    passes = {
+        'low': 2,      # 1 extract + 1 verify
+        'medium': 3,   # 1 extract + 2 verify
+        'high': 4,     # 1 extract + 3 verify
+        'ultra': 5     # 1 extract + 4 verify
+    }
+    
+    num_passes = passes.get(verification_level, 2)
+    extracted_texts = []
+    
+    for i in range(num_passes):
+        # Try different preprocessing for each pass
+        processed_image = image
+        
+        if i == 1:
+            # Increase contrast
+            processed_image = image.point(lambda p: p > 128 and 255)
+        elif i == 2:
+            # Denoise
+            processed_image = image.filter(ImageFilter.MedianFilter())
+        elif i == 3:
+            # Sharpen
+            processed_image = image.filter(ImageFilter.SHARPEN)
+        elif i == 4:
+            # Different DPI/scale
+            processed_image = image.resize((image.width * 2, image.height * 2), Image.Resampling.LANCZOS)
+        
+        text = pytesseract.image_to_string(processed_image)
+        extracted_texts.append(text)
+        
+        # Small delay between passes
+        await asyncio.sleep(0.1)
+    
+    # Get consensus text and confidence
+    final_text = get_consensus_text(extracted_texts)
+    confidence = calculate_confidence(extracted_texts)
+    
+    return {
+        'text': final_text,
+        'confidence': confidence,
+        'passes': num_passes,
+        'variations': len(set(extracted_texts))
+    }
+
+async def stream_ocr_progress(file_content: bytes, filename: str, file_id: str, verification_level: str = 'low'):
+    """Stream OCR progress with verification passes"""
     try:
         start_time = time.time()
         
         # Send start event
-        yield f"data: {json.dumps({'type': 'start', 'file_id': file_id, 'filename': filename, 'message': 'Starting processing...', 'start_time': start_time})}\n\n"
+        yield f"data: {json.dumps({'type': 'start', 'file_id': file_id, 'filename': filename, 'verification_level': verification_level, 'message': f'Starting processing with {verification_level} verification...', 'start_time': start_time})}\n\n"
         await asyncio.sleep(0.1)
         
         if filename.lower().endswith('.pdf'):
-            # Convert PDF to images
             images = pdf2image.convert_from_bytes(file_content, dpi=150)
             total_pages = len(images)
             
             yield f"data: {json.dumps({'type': 'info', 'file_id': file_id, 'total_pages': total_pages, 'message': f'PDF loaded: {total_pages} pages'})}\n\n"
             
             all_text = []
+            total_confidence = 0
             detected_languages = set()
             
             for i, image in enumerate(images, 1):
                 page_start_time = time.time()
                 
-                # Process each page
-                yield f"data: {json.dumps({'type': 'progress', 'file_id': file_id, 'current_page': i, 'total_pages': total_pages, 'progress': int((i-1)/total_pages * 100), 'message': f'Processing page {i}/{total_pages}', 'elapsed_time': round(time.time() - start_time, 1)})}\n\n"
+                yield f"data: {json.dumps({'type': 'progress', 'file_id': file_id, 'current_page': i, 'total_pages': total_pages, 'progress': int((i-1)/total_pages * 100), 'message': f'Processing page {i}/{total_pages} with {verification_level} verification', 'elapsed_time': round(time.time() - start_time, 1)})}\n\n"
                 
-                # First detect language using OSD (Orientation and Script Detection)
+                # Detect language
                 try:
                     osd = pytesseract.image_to_osd(image)
-                    # Extract script/language info from OSD output
                     script_info = [line for line in osd.split('\n') if 'Script:' in line]
                     if script_info:
                         detected_languages.add(script_info[0].split(':')[1].strip())
                 except:
                     pass
                 
-                # Use all available languages for best results
-                text = pytesseract.image_to_string(image)
+                # Run verification passes
+                result = await verify_ocr_extraction(image, verification_level)
                 
-                if text.strip():
-                    all_text.append(f"[Page {i}]\n{text}")
+                if result['text'].strip():
+                    all_text.append(f"[Page {i} - Confidence: {result['confidence']:.1f}%]\n{result['text']}")
                 
+                total_confidence += result['confidence']
                 page_time = round(time.time() - page_start_time, 1)
                 
-                # Send page complete event
-                yield f"data: {json.dumps({'type': 'page_complete', 'file_id': file_id, 'page': i, 'text_preview': text[:200] + '...' if len(text) > 200 else text, 'page_time': page_time})}\n\n"
+                yield f"data: {json.dumps({'type': 'page_complete', 'file_id': file_id, 'page': i, 'confidence': result['confidence'], 'passes': result['passes'], 'variations': result['variations'], 'text_preview': result['text'][:200] + '...' if len(result['text']) > 200 else result['text'], 'page_time': page_time})}\n\n"
                 await asyncio.sleep(0.1)
             
             final_text = "\n\n".join(all_text)
+            avg_confidence = total_confidence / total_pages if total_pages > 0 else 0
             detected_langs_str = ", ".join(detected_languages) if detected_languages else "Multiple/Unknown"
         else:
-            # Process single image
-            yield f"data: {json.dumps({'type': 'progress', 'file_id': file_id, 'progress': 50, 'message': 'Processing image...', 'elapsed_time': round(time.time() - start_time, 1)})}\n\n"
+            yield f"data: {json.dumps({'type': 'progress', 'file_id': file_id, 'progress': 50, 'message': f'Processing image with {verification_level} verification...', 'elapsed_time': round(time.time() - start_time, 1)})}\n\n"
             image = Image.open(io.BytesIO(file_content))
             
-            # Auto detect and extract
-            final_text = pytesseract.image_to_string(image)
+            result = await verify_ocr_extraction(image, verification_level)
+            final_text = result['text']
+            avg_confidence = result['confidence']
             detected_langs_str = "Auto-detected"
         
         total_time = round(time.time() - start_time, 1)
         
-        # Send completion event
-        yield f"data: {json.dumps({'type': 'complete', 'file_id': file_id, 'text': final_text, 'total_chars': len(final_text), 'detected_languages': detected_langs_str, 'message': 'Processing complete!', 'total_time': total_time})}\n\n"
+        yield f"data: {json.dumps({'type': 'complete', 'file_id': file_id, 'text': final_text, 'total_chars': len(final_text), 'average_confidence': avg_confidence, 'verification_level': verification_level, 'detected_languages': detected_langs_str, 'message': f'Processing complete! Average confidence: {avg_confidence:.1f}%', 'total_time': total_time})}\n\n"
         
     except Exception as e:
         yield f"data: {json.dumps({'type': 'error', 'file_id': file_id, 'error': str(e)})}\n\n"
@@ -95,7 +177,7 @@ async def main():
     <!DOCTYPE html>
     <html>
     <head>
-        <title>QUANARA OCR - Enterprise Lease Processing</title>
+        <title>QUANARA OCR - Enterprise Lease Processing with Verification</title>
         <style>
             * { margin: 0; padding: 0; box-sizing: border-box; }
             body { 
@@ -118,22 +200,6 @@ async def main():
                 overflow: hidden;
             }
             
-            .header::before {
-                content: '';
-                position: absolute;
-                top: -50%;
-                left: -50%;
-                width: 200%;
-                height: 200%;
-                background: radial-gradient(circle, rgba(102, 126, 234, 0.1) 0%, transparent 70%);
-                animation: pulse 4s ease-in-out infinite;
-            }
-            
-            @keyframes pulse {
-                0%, 100% { transform: scale(1); opacity: 0.5; }
-                50% { transform: scale(1.1); opacity: 0.3; }
-            }
-            
             .header h1 { 
                 font-size: 3.5rem; 
                 margin-bottom: 10px; 
@@ -144,11 +210,90 @@ async def main():
                 z-index: 1;
             }
             
-            .header p { 
-                font-size: 1.3rem; 
+            .verification-selector {
+                background: rgba(255, 255, 255, 0.05);
+                border-radius: 15px;
+                padding: 25px;
+                margin: 20px 0;
+                border: 1px solid rgba(255, 255, 255, 0.1);
+            }
+            
+            .verification-options {
+                display: grid;
+                grid-template-columns: repeat(4, 1fr);
+                gap: 15px;
+                margin-top: 15px;
+            }
+            
+            @media (max-width: 768px) {
+                .verification-options { grid-template-columns: repeat(2, 1fr); }
+            }
+            
+            .verification-option {
+                padding: 20px;
+                border: 2px solid rgba(255, 255, 255, 0.1);
+                border-radius: 12px;
+                cursor: pointer;
+                transition: all 0.3s;
+                text-align: center;
+                background: rgba(255, 255, 255, 0.03);
+            }
+            
+            .verification-option:hover {
+                transform: translateY(-2px);
+                border-color: #667eea;
+                box-shadow: 0 5px 20px rgba(102, 126, 234, 0.3);
+            }
+            
+            .verification-option.selected {
+                border-color: #667eea;
+                background: rgba(102, 126, 234, 0.2);
+                box-shadow: 0 0 20px rgba(102, 126, 234, 0.4);
+            }
+            
+            .verification-option h4 {
+                color: #e4e6eb;
+                margin-bottom: 8px;
+                font-size: 1.2rem;
+            }
+            
+            .verification-option .passes {
+                color: #667eea;
+                font-size: 2rem;
+                font-weight: bold;
+                margin: 10px 0;
+            }
+            
+            .verification-option .description {
                 color: #b4b7c2;
-                position: relative;
-                z-index: 1;
+                font-size: 0.85rem;
+            }
+            
+            .confidence-indicator {
+                display: inline-block;
+                padding: 4px 12px;
+                border-radius: 15px;
+                font-size: 12px;
+                font-weight: 600;
+                margin-left: 10px;
+            }
+            
+            .confidence-high {
+                background: rgba(40, 167, 69, 0.2);
+                color: #28a745;
+                border: 1px solid rgba(40, 167, 69, 0.3);
+            }
+            
+            .confidence-medium {
+                background: rgba(255, 193, 7, 0.2);
+                color: #ffc107;
+                border: 1px solid rgba(255, 193, 7, 0.3);
+            }
+            
+            .confidence-low {
+                background: rgba(220, 53, 69, 0.2);
+                color: #dc3545;
+                border: 1px solid rgba(220, 53, 69, 0.3);
             }
             
             .main-grid { 
@@ -168,12 +313,6 @@ async def main():
                 padding: 35px; 
                 border: 1px solid rgba(255, 255, 255, 0.1);
                 box-shadow: 0 10px 40px rgba(0, 0, 0, 0.4);
-            }
-            
-            .box h3 {
-                color: #e4e6eb;
-                margin-bottom: 20px;
-                font-size: 1.4rem;
             }
             
             .upload-area { 
@@ -228,11 +367,6 @@ async def main():
                 transition: all 0.3s;
             }
             
-            .file-item.processing {
-                border-color: #667eea;
-                box-shadow: 0 0 20px rgba(102, 126, 234, 0.2);
-            }
-            
             .progress-bar {
                 background: rgba(255, 255, 255, 0.1);
                 border-radius: 10px;
@@ -247,24 +381,6 @@ async def main():
                 height: 100%;
                 transition: width 0.3s ease;
                 border-radius: 10px;
-                position: relative;
-                overflow: hidden;
-            }
-            
-            .progress-fill::after {
-                content: '';
-                position: absolute;
-                top: 0;
-                left: 0;
-                bottom: 0;
-                right: 0;
-                background: linear-gradient(90deg, transparent, rgba(255, 255, 255, 0.2), transparent);
-                animation: progress-shine 1.5s linear infinite;
-            }
-            
-            @keyframes progress-shine {
-                0% { transform: translateX(-100%); }
-                100% { transform: translateX(100%); }
             }
             
             .status-badge {
@@ -301,138 +417,10 @@ async def main():
                 border: 1px solid rgba(220, 53, 69, 0.3);
             }
             
-            .timer {
-                display: inline-flex;
-                align-items: center;
-                padding: 8px 16px;
-                background: rgba(102, 126, 234, 0.1);
-                border-radius: 20px;
-                font-size: 14px;
-                font-weight: 600;
-                color: #667eea;
-                margin-left: 10px;
-            }
-            
-            .timer::before {
-                content: '⏱';
-                margin-right: 6px;
-            }
-            
-            .stats-grid {
-                display: grid;
-                grid-template-columns: repeat(4, 1fr);
-                gap: 20px;
-                margin: 30px 0;
-            }
-            
-            .stat-card {
-                background: rgba(255, 255, 255, 0.05);
-                padding: 20px;
-                border-radius: 15px;
+            .empty-state {
                 text-align: center;
-                border: 1px solid rgba(255, 255, 255, 0.1);
-            }
-            
-            .stat-value {
-                font-size: 2rem;
-                font-weight: bold;
-                color: #667eea;
-            }
-            
-            .stat-label {
-                font-size: 0.9rem;
-                color: #b4b7c2;
-                margin-top: 5px;
-            }
-            
-            .results-preview {
-                background: #0f1318;
-                padding: 20px;
-                border-radius: 10px;
-                margin-top: 15px;
-                max-height: 300px;
-                overflow-y: auto;
-                font-family: 'Consolas', 'Monaco', monospace;
-                font-size: 13px;
-                white-space: pre-wrap;
-                border: 1px solid rgba(255, 255, 255, 0.1);
-                color: #e4e6eb;
-            }
-            
-            .results-preview::-webkit-scrollbar {
-                width: 8px;
-            }
-            
-            .results-preview::-webkit-scrollbar-track {
-                background: rgba(255, 255, 255, 0.05);
-                border-radius: 4px;
-            }
-            
-            .results-preview::-webkit-scrollbar-thumb {
-                background: #667eea;
-                border-radius: 4px;
-            }
-            
-            .feature-grid {
-                display: grid;
-                grid-template-columns: repeat(auto-fit, minmax(250px, 1fr));
-                gap: 20px;
-                margin: 30px 0;
-                position: relative;
-                z-index: 1;
-            }
-            
-            .feature-card {
-                background: rgba(255, 255, 255, 0.05);
-                padding: 25px;
-                border-radius: 15px;
-                text-align: center;
-                border: 1px solid rgba(255, 255, 255, 0.1);
-                transition: all 0.3s;
-            }
-            
-            .feature-card:hover {
-                transform: translateY(-5px);
-                border-color: #667eea;
-                box-shadow: 0 10px 30px rgba(102, 126, 234, 0.2);
-            }
-            
-            .feature-icon {
-                font-size: 2.5rem;
-                margin-bottom: 10px;
-            }
-            
-            .feature-card strong {
-                color: #e4e6eb;
-                display: block;
-                margin-bottom: 5px;
-            }
-            
-            .feature-card p {
-                color: #b4b7c2;
-                font-size: 0.9rem;
-            }
-            
-            .queue-header {
-                display: flex;
-                justify-content: space-between;
-                align-items: center;
-                margin-bottom: 20px;
-            }
-            
-            .queue-info {
-                display: flex;
-                align-items: center;
-                gap: 20px;
-            }
-            
-            .queue-badge {
-                background: rgba(102, 126, 234, 0.2);
-                color: #667eea;
-                padding: 8px 16px;
-                border-radius: 20px;
-                font-size: 14px;
-                font-weight: 600;
+                padding: 60px 20px;
+                color: #6c757d;
             }
             
             code {
@@ -442,83 +430,40 @@ async def main():
                 border-radius: 4px;
                 font-family: 'Consolas', monospace;
             }
-            
-            .api-endpoint {
-                background: rgba(255, 255, 255, 0.05);
-                padding: 15px;
-                border-radius: 8px;
-                margin: 15px 0;
-                font-family: 'Consolas', monospace;
-                border: 1px solid rgba(255, 255, 255, 0.1);
-            }
-            
-            pre {
-                background: #0f1318;
-                padding: 20px;
-                border-radius: 8px;
-                overflow-x: auto;
-                color: #e4e6eb;
-                border: 1px solid rgba(255, 255, 255, 0.1);
-            }
-            
-            .empty-state {
-                text-align: center;
-                padding: 60px 20px;
-                color: #6c757d;
-            }
-            
-            .empty-state-icon {
-                font-size: 4rem;
-                opacity: 0.3;
-                margin-bottom: 20px;
-            }
         </style>
     </head>
     <body>
         <div class="container">
             <div class="header">
                 <h1>🏢 QUANARA OCR</h1>
-                <p>Enterprise Lease Document Processing</p>
-                <div class="feature-grid">
-                    <div class="feature-card">
-                        <div class="feature-icon">📄</div>
-                        <strong>Sequential Processing</strong>
-                        <p>One document at a time for accuracy</p>
-                    </div>
-                    <div class="feature-card">
-                        <div class="feature-icon">🔍</div>
-                        <strong>Auto Language Detection</strong>
-                        <p>Supports 100+ languages</p>
-                    </div>
-                    <div class="feature-card">
-                        <div class="feature-icon">⏱️</div>
-                        <strong>Real-Time Tracking</strong>
-                        <p>Live progress & time elapsed</p>
-                    </div>
-                    <div class="feature-card">
-                        <div class="feature-icon">🚀</div>
-                        <strong>Enterprise Ready</strong>
-                        <p>Handles 500+ page documents</p>
-                    </div>
-                </div>
+                <p>Enterprise Lease Document Processing with Multi-Pass Verification</p>
             </div>
             
-            <div class="stats-grid" id="globalStats" style="display: none;">
-                <div class="stat-card">
-                    <div class="stat-value" id="totalFiles">0</div>
-                    <div class="stat-label">Files Processed</div>
-                </div>
-                <div class="stat-card">
-                    <div class="stat-value" id="totalPages">0</div>
-                    <div class="stat-label">Pages Scanned</div>
-                </div>
-                <div class="stat-card">
-                    <div class="stat-value" id="totalChars">0</div>
-                    <div class="stat-label">Characters Extracted</div>
-                </div>
-                <div class="stat-card">
-                    <div class="stat-value" id="totalTime">0s</div>
-                    <div class="stat-label">Total Time</div>
+            <div class="verification-selector">
+                <h3 style="color: #e4e6eb; margin-bottom: 10px;">🔍 Accuracy Verification Level</h3>
+                <p style="color: #b4b7c2; font-size: 0.9rem;">Choose how many verification passes to ensure accuracy</p>
+                
+                <div class="verification-options">
+                    <div class="verification-option selected" data-level="low">
+                        <h4>Low</h4>
+                        <div class="passes">2x</div>
+                        <div class="description">1 extract + 1 verify<br>Fast processing</div>
+                    </div>
+                    <div class="verification-option" data-level="medium">
+                        <h4>Medium</h4>
+                        <div class="passes">3x</div>
+                        <div class="description">1 extract + 2 verify<br>Balanced accuracy</div>
+                    </div>
+                    <div class="verification-option" data-level="high">
+                        <h4>High</h4>
+                        <div class="passes">4x</div>
+                        <div class="description">1 extract + 3 verify<br>High confidence</div>
+                    </div>
+                    <div class="verification-option" data-level="ultra">
+                        <h4>Ultra</h4>
+                        <div class="passes">5x</div>
+                        <div class="description">1 extract + 4 verify<br>Maximum accuracy</div>
+                    </div>
                 </div>
             </div>
             
@@ -526,9 +471,9 @@ async def main():
                 <div class="box">
                     <h3>📤 Upload Lease Documents</h3>
                     <div class="upload-area" id="uploadArea" onclick="document.getElementById('fileInput').click()">
-                        <div class="feature-icon">📁</div>
+                        <div style="font-size: 3rem;">📁</div>
                         <h4 style="color: #e4e6eb; margin: 15px 0;">Drop Lease Documents Here</h4>
-                        <p style="color: #b4b7c2;">Support for PDF files up to 500 pages</p>
+                        <p style="color: #b4b7c2;">Files will be processed with <code id="selectedLevel">Low (2x)</code> verification</p>
                         <input type="file" id="fileInput" accept=".pdf,.jpg,.jpeg,.png" multiple>
                     </div>
                     
@@ -538,43 +483,39 @@ async def main():
                 </div>
                 
                 <div class="box">
-                    <div class="queue-header">
-                        <h3>📋 Processing Queue</h3>
-                        <div class="queue-info">
-                            <div class="queue-badge" id="queueCount">0 files in queue</div>
-                            <div class="timer" id="currentTimer" style="display: none;">0s</div>
-                        </div>
-                    </div>
+                    <h3>📋 Processing Queue</h3>
                     <div id="filesList">
                         <div class="empty-state">
-                            <div class="empty-state-icon">📭</div>
+                            <div style="font-size: 3rem; opacity: 0.3;">📭</div>
                             <p>No files uploaded yet</p>
-                            <p style="font-size: 0.9rem; margin-top: 10px;">Drop your lease documents to begin</p>
                         </div>
                     </div>
                 </div>
-            </div>
-            
-            <div class="box" id="resultsBox" style="display: none;">
-                <h3>📊 Extraction Results</h3>
-                <div id="resultsArea"></div>
             </div>
         </div>
         
         <script>
             let uploadedFiles = [];
-            let isProcessing = false;
-            let currentFileIndex = 0;
-            let globalStats = {
-                files: 0,
-                pages: 0,
-                chars: 0,
-                time: 0
-            };
-            let currentTimer = null;
-            let timerStart = null;
+            let selectedVerificationLevel = 'low';
             
-            // Drag and drop
+            // Verification level selection
+            document.querySelectorAll('.verification-option').forEach(option => {
+                option.addEventListener('click', function() {
+                    document.querySelectorAll('.verification-option').forEach(o => o.classList.remove('selected'));
+                    this.classList.add('selected');
+                    selectedVerificationLevel = this.dataset.level;
+                    
+                    const levelText = {
+                        'low': 'Low (2x)',
+                        'medium': 'Medium (3x)',
+                        'high': 'High (4x)',
+                        'ultra': 'Ultra (5x)'
+                    };
+                    document.getElementById('selectedLevel').textContent = levelText[selectedVerificationLevel];
+                });
+            });
+            
+            // File handling functions
             const uploadArea = document.getElementById('uploadArea');
             ['dragenter', 'dragover', 'dragleave', 'drop'].forEach(eventName => {
                 uploadArea.addEventListener(eventName, preventDefaults, false);
@@ -584,14 +525,6 @@ async def main():
                 e.preventDefault();
                 e.stopPropagation();
             }
-            
-            ['dragenter', 'dragover'].forEach(eventName => {
-                uploadArea.addEventListener(eventName, () => uploadArea.classList.add('dragover'), false);
-            });
-            
-            ['dragleave', 'drop'].forEach(eventName => {
-                uploadArea.addEventListener(eventName, () => uploadArea.classList.remove('dragover'), false);
-            });
             
             uploadArea.addEventListener('drop', handleDrop, false);
             
@@ -605,123 +538,78 @@ async def main():
             });
             
             function handleFiles(files) {
-                const pdfFiles = files.filter(file => 
-                    file.type === 'application/pdf' || 
-                    file.name.toLowerCase().endsWith('.pdf') ||
-                    file.type.startsWith('image/')
-                );
-                
-                pdfFiles.forEach(file => {
+                files.forEach(file => {
                     const fileId = 'file-' + Date.now() + '-' + Math.random().toString(36).substr(2, 9);
                     uploadedFiles.push({
                         id: fileId,
                         file: file,
                         status: 'waiting',
                         progress: 0,
-                        startTime: null,
-                        elapsedTime: 0
+                        verificationLevel: selectedVerificationLevel
                     });
                 });
                 
                 updateFilesList();
-                updateQueueCount();
                 document.getElementById('processBtn').disabled = uploadedFiles.length === 0;
-            }
-            
-            function updateQueueCount() {
-                const waiting = uploadedFiles.filter(f => f.status === 'waiting').length;
-                const processing = uploadedFiles.filter(f => f.status === 'processing').length;
-                document.getElementById('queueCount').textContent = 
-                    `${waiting} waiting, ${processing} processing`;
             }
             
             function updateFilesList() {
                 const filesList = document.getElementById('filesList');
                 if (uploadedFiles.length === 0) {
-                    filesList.innerHTML = `
-                        <div class="empty-state">
-                            <div class="empty-state-icon">📭</div>
-                            <p>No files uploaded yet</p>
-                            <p style="font-size: 0.9rem; margin-top: 10px;">Drop your lease documents to begin</p>
-                        </div>
-                    `;
+                    filesList.innerHTML = '<div class="empty-state"><div style="font-size: 3rem; opacity: 0.3;">📭</div><p>No files uploaded yet</p></div>';
                     return;
                 }
                 
-                filesList.innerHTML = uploadedFiles.map((fileInfo, index) => `
-                    <div class="file-item ${fileInfo.status === 'processing' ? 'processing' : ''}" id="${fileInfo.id}">
-                        <div style="display: flex; justify-content: space-between; align-items: center;">
-                            <div>
-                                <strong style="font-size: 1.1rem;">${fileInfo.file.name}</strong>
-                                ${fileInfo.status === 'waiting' && index > currentFileIndex ? 
-                                    `<span style="color: #6c757d; margin-left: 10px;">(Position ${index - currentFileIndex} in queue)</span>` : ''}
-                            </div>
-                            <div style="display: flex; align-items: center; gap: 10px;">
-                                ${fileInfo.elapsedTime > 0 ? `<span class="timer">${fileInfo.elapsedTime}s</span>` : ''}
+                filesList.innerHTML = uploadedFiles.map(fileInfo => {
+                    const levelText = {
+                        'low': '2x verification',
+                        'medium': '3x verification',
+                        'high': '4x verification',
+                        'ultra': '5x verification'
+                    };
+                    
+                    return `
+                        <div class="file-item">
+                            <div style="display: flex; justify-content: space-between; align-items: center;">
+                                <div>
+                                    <strong>${fileInfo.file.name}</strong>
+                                    <span style="color: #667eea; margin-left: 10px; font-size: 0.9rem;">${levelText[fileInfo.verificationLevel]}</span>
+                                </div>
                                 <span class="status-badge status-${fileInfo.status}">${fileInfo.status}</span>
                             </div>
+                            <div class="progress-bar">
+                                <div class="progress-fill" style="width: ${fileInfo.progress}%"></div>
+                            </div>
+                            <div id="${fileInfo.id}-message" style="font-size: 14px; color: #b4b7c2; margin-top: 10px;"></div>
+                            <div id="${fileInfo.id}-confidence"></div>
                         </div>
-                        <div class="progress-bar">
-                            <div class="progress-fill" style="width: ${fileInfo.progress}%"></div>
-                        </div>
-                        <div id="${fileInfo.id}-message" style="font-size: 14px; color: #b4b7c2; margin-top: 10px;"></div>
-                    </div>
-                `).join('');
-            }
-            
-            function startTimer() {
-                timerStart = Date.now();
-                document.getElementById('currentTimer').style.display = 'inline-flex';
-                
-                currentTimer = setInterval(() => {
-                    const elapsed = Math.floor((Date.now() - timerStart) / 1000);
-                    document.getElementById('currentTimer').textContent = elapsed + 's';
-                }, 100);
-            }
-            
-            function stopTimer() {
-                if (currentTimer) {
-                    clearInterval(currentTimer);
-                    currentTimer = null;
-                }
-                document.getElementById('currentTimer').style.display = 'none';
+                    `;
+                }).join('');
             }
             
             async function processAllFiles() {
-                if (isProcessing) return;
-                
-                isProcessing = true;
                 document.getElementById('processBtn').disabled = true;
-                document.getElementById('globalStats').style.display = 'grid';
                 
-                // Process files sequentially
-                for (let i = 0; i < uploadedFiles.length; i++) {
-                    currentFileIndex = i;
-                    const fileInfo = uploadedFiles[i];
-                    
+                for (let fileInfo of uploadedFiles) {
                     if (fileInfo.status === 'waiting') {
                         await processFile(fileInfo);
                     }
                 }
                 
-                isProcessing = false;
                 document.getElementById('processBtn').disabled = uploadedFiles.filter(f => f.status === 'waiting').length === 0;
-                stopTimer();
             }
             
             async function processFile(fileInfo) {
                 fileInfo.status = 'processing';
-                fileInfo.startTime = Date.now();
-                startTimer();
                 updateFilesList();
-                updateQueueCount();
                 
                 const formData = new FormData();
                 formData.append('file', fileInfo.file);
                 formData.append('file_id', fileInfo.id);
+                formData.append('verification_level', fileInfo.verificationLevel);
                 
                 try {
-                    const response = await fetch('/stream-extract', {
+                    const response = await fetch('/stream-extract?verification_level=' + fileInfo.verificationLevel, {
                         method: 'POST',
                         body: formData
                     });
@@ -753,141 +641,50 @@ async def main():
                     fileInfo.status = 'error';
                     document.getElementById(fileInfo.id + '-message').textContent = 'Error: ' + error.message;
                     updateFilesList();
-                    stopTimer();
                 }
-                
-                updateQueueCount();
             }
             
             function handleStreamData(data, fileInfo) {
                 const messageEl = document.getElementById(fileInfo.id + '-message');
+                const confidenceEl = document.getElementById(fileInfo.id + '-confidence');
                 
                 switch(data.type) {
-                    case 'start':
-                        messageEl.textContent = data.message;
-                        break;
-                        
-                    case 'info':
-                        messageEl.textContent = data.message;
-                        break;
-                        
                     case 'progress':
                         fileInfo.progress = data.progress;
-                        fileInfo.elapsedTime = Math.round(data.elapsed_time);
                         messageEl.textContent = data.message;
                         updateFilesList();
                         break;
                         
                     case 'page_complete':
-                        const progress = Math.round((data.page / data.total_pages) * 100);
-                        fileInfo.progress = progress;
-                        updateFilesList();
+                        if (data.confidence) {
+                            const confidenceClass = data.confidence > 90 ? 'high' : data.confidence > 70 ? 'medium' : 'low';
+                            confidenceEl.innerHTML = `
+                                <span class="confidence-indicator confidence-${confidenceClass}">
+                                    Page confidence: ${data.confidence.toFixed(1)}% (${data.passes} passes, ${data.variations} variations)
+                                </span>
+                            `;
+                        }
                         break;
                         
                     case 'complete':
                         fileInfo.status = 'complete';
                         fileInfo.progress = 100;
-                        fileInfo.extractedText = data.text;
-                        fileInfo.totalTime = data.total_time;
-                        fileInfo.elapsedTime = Math.round(data.total_time);
-                        fileInfo.detectedLanguages = data.detected_languages || 'Auto-detected';
-                        messageEl.textContent = `Complete! ${data.total_chars} characters extracted in ${data.total_time}s`;
-                        
-                        // Update global stats
-                        globalStats.files++;
-                        globalStats.pages += data.total_pages || 1;
-                        globalStats.chars += data.total_chars || 0;
-                        globalStats.time += data.total_time || 0;
-                        updateGlobalStats();
-                        
+                        const avgConfidenceClass = data.average_confidence > 90 ? 'high' : data.average_confidence > 70 ? 'medium' : 'low';
+                        messageEl.innerHTML = `
+                            Complete! ${data.total_chars} characters extracted
+                            <span class="confidence-indicator confidence-${avgConfidenceClass}">
+                                Average confidence: ${data.average_confidence.toFixed(1)}%
+                            </span>
+                        `;
                         updateFilesList();
-                        displayResults(fileInfo);
-                        stopTimer();
                         break;
                         
                     case 'error':
                         fileInfo.status = 'error';
                         messageEl.textContent = 'Error: ' + data.error;
                         updateFilesList();
-                        stopTimer();
                         break;
                 }
-            }
-            
-            function updateGlobalStats() {
-                document.getElementById('totalFiles').textContent = globalStats.files;
-                document.getElementById('totalPages').textContent = globalStats.pages;
-                document.getElementById('totalChars').textContent = 
-                    globalStats.chars > 1000000 ? 
-                    (globalStats.chars / 1000000).toFixed(1) + 'M' : 
-                    globalStats.chars.toLocaleString();
-                document.getElementById('totalTime').textContent = 
-                    Math.round(globalStats.time) + 's';
-            }
-            
-            function displayResults(fileInfo) {
-                document.getElementById('resultsBox').style.display = 'block';
-                const resultsArea = document.getElementById('resultsArea');
-                
-                const resultHtml = `
-                    <div class="file-item" style="margin-bottom: 25px;">
-                        <h4 style="color: #e4e6eb; font-size: 1.2rem; margin-bottom: 10px;">${fileInfo.file.name}</h4>
-                        <p style="color: #b4b7c2; font-size: 14px;">
-                            Processed in ${fileInfo.totalTime}s | Languages: ${fileInfo.detectedLanguages}
-                        </p>
-                        <div style="display: flex; gap: 10px; margin: 15px 0;">
-                            <button class="btn" onclick="downloadText('${fileInfo.id}')" style="padding: 10px 20px; font-size: 14px;">
-                                📥 Download Text
-                            </button>
-                            <button class="btn" onclick="copyText('${fileInfo.id}')" style="padding: 10px 20px; font-size: 14px; background: linear-gradient(45deg, #28a745, #20c997);">
-                                📋 Copy to Clipboard
-                            </button>
-                        </div>
-                        <div class="results-preview" id="result-${fileInfo.id}">
-                            ${fileInfo.extractedText}
-                        </div>
-                    </div>
-                `;
-                
-                if (resultsArea.innerHTML === '') {
-                    resultsArea.innerHTML = resultHtml;
-                } else {
-                    resultsArea.innerHTML += resultHtml;
-                }
-                
-                // Store text for download/copy
-                window.extractedTexts = window.extractedTexts || {};
-                window.extractedTexts[fileInfo.id] = fileInfo.extractedText;
-            }
-            
-            function downloadText(fileId) {
-                const text = window.extractedTexts[fileId];
-                const fileInfo = uploadedFiles.find(f => f.id === fileId);
-                const fileName = fileInfo.file.name.replace(/\.[^/.]+$/, "") + "_extracted.txt";
-                
-                const blob = new Blob([text], { type: 'text/plain' });
-                const url = URL.createObjectURL(blob);
-                const a = document.createElement('a');
-                a.href = url;
-                a.download = fileName;
-                a.click();
-                URL.revokeObjectURL(url);
-            }
-            
-            function copyText(fileId) {
-                const text = window.extractedTexts[fileId];
-                navigator.clipboard.writeText(text).then(() => {
-                    // Show success feedback
-                    const btn = event.target;
-                    const originalText = btn.textContent;
-                    btn.textContent = '✓ Copied!';
-                    btn.style.background = 'linear-gradient(45deg, #28a745, #20c997)';
-                    
-                    setTimeout(() => {
-                        btn.textContent = originalText;
-                        btn.style.background = '';
-                    }, 2000);
-                });
             }
         </script>
     </body>
@@ -929,13 +726,21 @@ async def extract_text(file: UploadFile = File(...)):
         raise HTTPException(status_code=400, detail=str(e))
 
 @app.post("/stream-extract")
-async def stream_extract(file: UploadFile = File(...), file_id: str = None):
-    """Extract text with real-time progress streaming and auto language detection"""
+async def stream_extract(
+    file: UploadFile = File(...), 
+    file_id: str = None,
+    verification_level: str = Form('low')
+):
+    """Extract text with real-time progress streaming and verification passes"""
     content = await file.read()
     file_id = file_id or str(uuid.uuid4())
     
+    # Validate verification level
+    if verification_level not in ['low', 'medium', 'high', 'ultra']:
+        verification_level = 'low'
+    
     return StreamingResponse(
-        stream_ocr_progress(content, file.filename, file_id),
+        stream_ocr_progress(content, file.filename, file_id, verification_level),
         media_type="text/event-stream",
         headers={
             "Cache-Control": "no-cache",
@@ -943,6 +748,18 @@ async def stream_extract(file: UploadFile = File(...), file_id: str = None):
             "X-Accel-Buffering": "no"
         }
     )
+
+@app.get("/languages")
+async def get_available_languages():
+    """Get list of available OCR languages"""
+    try:
+        languages = pytesseract.get_languages(config='')
+        return {
+            "total": len(languages),
+            "languages": sorted(languages)
+        }
+    except Exception as e:
+        return {"error": str(e)}
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 8080))
