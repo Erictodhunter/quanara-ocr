@@ -513,6 +513,57 @@ async def main():
                 font-size: 13px;
                 margin: 12px 0;
             }
+            
+            /* Modal styles */
+            .modal {
+                display: none;
+                position: fixed;
+                z-index: 1000;
+                left: 0;
+                top: 0;
+                width: 100%;
+                height: 100%;
+                background-color: rgba(0,0,0,0.4);
+            }
+            
+            .modal-content {
+                background-color: white;
+                margin: 2% auto;
+                padding: 0;
+                border: 1px solid var(--ms-gray-30);
+                width: 90%;
+                max-width: 1200px;
+                height: 90vh;
+                box-shadow: 0 4px 8px rgba(0,0,0,0.1);
+                display: flex;
+                flex-direction: column;
+            }
+            
+            .modal-header {
+                padding: 16px 20px;
+                background: var(--ms-gray-20);
+                border-bottom: 1px solid var(--ms-gray-30);
+                display: flex;
+                justify-content: space-between;
+                align-items: center;
+            }
+            
+            .modal-body {
+                padding: 20px;
+                overflow-y: auto;
+                flex: 1;
+            }
+            
+            .close-modal {
+                font-size: 28px;
+                font-weight: bold;
+                color: var(--ms-gray-70);
+                cursor: pointer;
+            }
+            
+            .close-modal:hover {
+                color: var(--ms-gray-90);
+            }
         </style>
     </head>
     <body>
@@ -716,10 +767,25 @@ Response:
             </div>
         </div>
         
+        <!-- Modal for full text view -->
+        <div id="textModal" class="modal">
+            <div class="modal-content">
+                <div class="modal-header">
+                    <h3 id="modalTitle">Document Text</h3>
+                    <span class="close-modal" onclick="closeModal()">&times;</span>
+                </div>
+                <div class="modal-body">
+                    <div id="modalStats" class="mb-3"></div>
+                    <pre id="modalText" style="white-space: pre-wrap; word-wrap: break-word; font-family: 'Consolas', monospace;"></pre>
+                </div>
+            </div>
+        </div>
+        
         <script>
             let uploadedFiles = [];
             let selectedVerificationLevel = 'low';
             let currentTab = 'upload';
+            window.extractedTexts = {};
             
             function showTab(tab) {
                 currentTab = tab;
@@ -921,6 +987,9 @@ Response:
                             </span>
                         `;
                         
+                        // Store the full text
+                        window.extractedTexts[data.file_id] = data.text;
+                        
                         // Show result
                         displayResult(data, fileInfo);
                         updateFilesList();
@@ -936,6 +1005,10 @@ Response:
             
             function displayResult(data, fileInfo) {
                 const resultsArea = document.getElementById('resultsArea');
+                const previewLength = 1000; // Show more in preview
+                const preview = data.text.substring(0, previewLength);
+                const hasMore = data.text.length > previewLength;
+                
                 resultsArea.innerHTML += `
                     <div class="results-section">
                         <h5>${fileInfo.file.name}</h5>
@@ -943,16 +1016,16 @@ Response:
                             <span class="confidence-badge confidence-${data.average_confidence > 90 ? 'high' : data.average_confidence > 70 ? 'medium' : 'low'}">
                                 Confidence: ${data.average_confidence.toFixed(1)}%
                             </span>
-                            <span class="ms-3">Characters: ${data.total_chars}</span>
+                            <span class="ms-3">Characters: ${data.total_chars.toLocaleString()}</span>
                             <span class="ms-3">Time: ${data.total_time}s</span>
                         </div>
                         <div class="mt-2">
                             <button class="ms-button secondary" onclick="viewResult('${data.file_id}')">View Full Text</button>
                             <button class="ms-button secondary" onclick="downloadResult('${data.file_id}')">Download</button>
-                            <button class="ms-button secondary" onclick="copyResult('${data.file_id}')">Copy</button>
+                            <button class="ms-button secondary" onclick="copyResult('${data.file_id}')">Copy All</button>
                         </div>
-                        <div class="result-text" id="preview-${data.file_id}" style="max-height: 200px;">
-                            ${data.text.substring(0, 500)}${data.text.length > 500 ? '...' : ''}
+                        <div class="result-text" id="preview-${data.file_id}">
+                            ${preview}${hasMore ? '\\n\\n... [Click "View Full Text" to see all ' + data.total_chars.toLocaleString() + ' characters]' : ''}
                         </div>
                     </div>
                 `;
@@ -993,13 +1066,60 @@ Response:
             
             async function viewResult(fileId) {
                 try {
-                    const response = await fetch(`/api/result/${fileId}`);
-                    const result = await response.json();
+                    // First check if we have it in memory
+                    let resultText = window.extractedTexts[fileId];
+                    let filename = 'Document';
+                    let stats = {};
                     
-                    // Show in modal or expand view
-                    alert('Full text view would open here with:\\n\\n' + result.text.substring(0, 200) + '...');
+                    if (!resultText) {
+                        // Fetch from API
+                        const response = await fetch(`/api/result/${fileId}`);
+                        const result = await response.json();
+                        resultText = result.text;
+                        filename = result.filename;
+                        stats = {
+                            characters: result.character_count,
+                            confidence: result.confidence,
+                            verification: result.verification_level,
+                            time: result.total_time
+                        };
+                    } else {
+                        // Get stats from uploaded files
+                        const fileInfo = uploadedFiles.find(f => f.resultId === fileId);
+                        if (fileInfo) {
+                            filename = fileInfo.file.name;
+                        }
+                    }
+                    
+                    // Show in modal
+                    document.getElementById('modalTitle').textContent = filename;
+                    document.getElementById('modalText').textContent = resultText;
+                    
+                    if (stats.characters) {
+                        document.getElementById('modalStats').innerHTML = `
+                            <strong>Characters:</strong> ${stats.characters.toLocaleString()} | 
+                            <strong>Confidence:</strong> ${stats.confidence.toFixed(1)}% | 
+                            <strong>Verification:</strong> ${stats.verification} | 
+                            <strong>Processing Time:</strong> ${stats.time}s
+                        `;
+                    }
+                    
+                    document.getElementById('textModal').style.display = 'block';
                 } catch (error) {
                     console.error('Error viewing result:', error);
+                    alert('Error loading document text');
+                }
+            }
+            
+            function closeModal() {
+                document.getElementById('textModal').style.display = 'none';
+            }
+            
+            // Close modal when clicking outside
+            window.onclick = function(event) {
+                const modal = document.getElementById('textModal');
+                if (event.target == modal) {
+                    modal.style.display = 'none';
                 }
             }
             
@@ -1009,10 +1129,15 @@ Response:
             
             async function copyResult(fileId) {
                 try {
-                    const response = await fetch(`/api/result/${fileId}`);
-                    const result = await response.json();
+                    let text = window.extractedTexts[fileId];
                     
-                    await navigator.clipboard.writeText(result.text);
+                    if (!text) {
+                        const response = await fetch(`/api/result/${fileId}`);
+                        const result = await response.json();
+                        text = result.text;
+                    }
+                    
+                    await navigator.clipboard.writeText(text);
                     
                     // Show feedback
                     const btn = event.target;
@@ -1023,6 +1148,7 @@ Response:
                     }, 2000);
                 } catch (error) {
                     console.error('Error copying result:', error);
+                    alert('Error copying text to clipboard');
                 }
             }
         </script>
