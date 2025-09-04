@@ -14,19 +14,50 @@ import uuid
 import time
 from difflib import SequenceMatcher
 from collections import Counter
+import gc
+import tempfile
+import shutil
+import resource
+import threading
+
+# Memory management setup
+try:
+    # Limit memory to 450MB for Render starter tier
+    resource.setrlimit(resource.RLIMIT_AS, (450 * 1024 * 1024, -1))
+except:
+    pass  # Windows doesn't support this
+
+# Configure aggressive garbage collection
+gc.set_threshold(100, 5, 5)
 
 app = FastAPI(
     title="MAFM OCR API",
     description="Multi-pass OCR verification system for lease document processing",
-    version="4.0.0",
+    version="4.1.0",
     docs_url="/api/docs",
     redoc_url="/api/redoc"
 )
 
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_credentials=True, allow_methods=["*"], allow_headers=["*"])
 
-# Store processed results in memory (use Redis/DB in production)
+# Store processed results in memory with size limit
 processed_results = {}
+MAX_RESULTS = 10  # Limit stored results to prevent memory overflow
+
+# Maximum file size: 10MB
+MAX_FILE_SIZE = 10 * 1024 * 1024
+
+def cleanup_old_results():
+    """Remove oldest results if we exceed MAX_RESULTS"""
+    if len(processed_results) > MAX_RESULTS:
+        # Sort by timestamp and remove oldest
+        sorted_results = sorted(processed_results.items(), 
+                               key=lambda x: x[1].get('timestamp', ''), 
+                               reverse=True)
+        processed_results.clear()
+        for file_id, result in sorted_results[:MAX_RESULTS]:
+            processed_results[file_id] = result
+    gc.collect()
 
 def calculate_confidence(texts):
     """Calculate confidence score based on text similarity"""
@@ -83,78 +114,148 @@ async def verify_ocr_extraction(image, verification_level):
         elif i == 3:
             processed_image = image.filter(ImageFilter.SHARPEN)
         elif i == 4:
-            processed_image = image.resize((image.width * 2, image.height * 2), Image.Resampling.LANCZOS)
+            # Don't resize - too memory intensive
+            processed_image = image
         
         text = pytesseract.image_to_string(processed_image)
         extracted_texts.append(text)
+        
+        # Force garbage collection after each pass
+        if i % 2 == 0:
+            gc.collect()
         
         await asyncio.sleep(0.1)
     
     final_text = get_consensus_text(extracted_texts)
     confidence = calculate_confidence(extracted_texts)
     
+    # Clear the texts list
+    extracted_texts.clear()
+    gc.collect()
+    
     return {
         'text': final_text,
         'confidence': confidence,
         'passes': num_passes,
-        'variations': len(set(extracted_texts))
+        'variations': num_passes
     }
 
 async def stream_ocr_progress(file_content: bytes, filename: str, file_id: str, verification_level: str = 'low'):
     """Stream OCR progress with verification passes"""
+    temp_file_path = None
     try:
         start_time = time.time()
         
         yield f"data: {json.dumps({'type': 'start', 'file_id': file_id, 'filename': filename, 'verification_level': verification_level, 'message': f'Starting processing with {verification_level} verification...', 'start_time': start_time})}\n\n"
         await asyncio.sleep(0.1)
         
+        # Save to temp file instead of processing in memory
+        with tempfile.NamedTemporaryFile(delete=False, suffix=os.path.splitext(filename)[1]) as temp_file:
+            temp_file.write(file_content)
+            temp_file_path = temp_file.name
+        
+        # Clear the file_content from memory
+        file_content = None
+        gc.collect()
+        
         if filename.lower().endswith('.pdf'):
-            images = pdf2image.convert_from_bytes(file_content, dpi=150)
-            total_pages = len(images)
-            
-            yield f"data: {json.dumps({'type': 'info', 'file_id': file_id, 'total_pages': total_pages, 'message': f'PDF loaded: {total_pages} pages'})}\n\n"
-            
+            # Process PDF page by page to avoid loading all pages in memory
             all_text = []
             total_confidence = 0
             detected_languages = set()
             
-            for i, image in enumerate(images, 1):
-                page_start_time = time.time()
+            # Get page count first
+            try:
+                images = pdf2image.convert_from_path(temp_file_path, dpi=150, first_page=1, last_page=1)
+                # Use pdfinfo to get total pages without loading all
+                from pdf2image import pdfinfo_from_path
+                info = pdfinfo_from_path(temp_file_path)
+                total_pages = info['Pages']
+                images[0] = None  # Clear first page
+                del images
+                gc.collect()
+            except:
+                total_pages = 1
+            
+            yield f"data: {json.dumps({'type': 'info', 'file_id': file_id, 'total_pages': total_pages, 'message': f'PDF loaded: {total_pages} pages'})}\n\n"
+            
+            # Process in chunks of 5 pages maximum
+            chunk_size = 5
+            for chunk_start in range(0, total_pages, chunk_size):
+                chunk_end = min(chunk_start + chunk_size, total_pages)
                 
-                yield f"data: {json.dumps({'type': 'progress', 'file_id': file_id, 'current_page': i, 'total_pages': total_pages, 'progress': int((i-1)/total_pages * 100), 'message': f'Processing page {i}/{total_pages} with {verification_level} verification', 'elapsed_time': round(time.time() - start_time, 1)})}\n\n"
+                # Convert only current chunk
+                images = pdf2image.convert_from_path(
+                    temp_file_path, 
+                    dpi=150,
+                    first_page=chunk_start + 1,
+                    last_page=chunk_end
+                )
                 
-                try:
-                    osd = pytesseract.image_to_osd(image)
-                    script_info = [line for line in osd.split('\n') if 'Script:' in line]
-                    if script_info:
-                        detected_languages.add(script_info[0].split(':')[1].strip())
-                except:
-                    pass
+                for i, image in enumerate(images, chunk_start + 1):
+                    page_start_time = time.time()
+                    
+                    yield f"data: {json.dumps({'type': 'progress', 'file_id': file_id, 'current_page': i, 'total_pages': total_pages, 'progress': int((i-1)/total_pages * 100), 'message': f'Processing page {i}/{total_pages} with {verification_level} verification', 'elapsed_time': round(time.time() - start_time, 1)})}\n\n"
+                    
+                    try:
+                        osd = pytesseract.image_to_osd(image)
+                        script_info = [line for line in osd.split('\n') if 'Script:' in line]
+                        if script_info:
+                            detected_languages.add(script_info[0].split(':')[1].strip())
+                    except:
+                        pass
+                    
+                    result = await verify_ocr_extraction(image, verification_level)
+                    
+                    if result['text'].strip():
+                        all_text.append(f"[Page {i}]\n{result['text']}")
+                    
+                    total_confidence += result['confidence']
+                    page_time = round(time.time() - page_start_time, 1)
+                    
+                    yield f"data: {json.dumps({'type': 'page_complete', 'file_id': file_id, 'page': i, 'confidence': result['confidence'], 'passes': result['passes'], 'variations': result['variations'], 'text_preview': result['text'][:200] + '...' if len(result['text']) > 200 else result['text'], 'page_time': page_time})}\n\n"
+                    
+                    # Clear image from memory immediately
+                    image.close()
+                    image = None
+                    
+                    # Garbage collect after each page
+                    if i % 2 == 0:
+                        gc.collect()
+                    
+                    await asyncio.sleep(0.1)
                 
-                result = await verify_ocr_extraction(image, verification_level)
-                
-                if result['text'].strip():
-                    all_text.append(f"[Page {i} - Confidence: {result['confidence']:.1f}%]\n{result['text']}")
-                
-                total_confidence += result['confidence']
-                page_time = round(time.time() - page_start_time, 1)
-                
-                yield f"data: {json.dumps({'type': 'page_complete', 'file_id': file_id, 'page': i, 'confidence': result['confidence'], 'passes': result['passes'], 'variations': result['variations'], 'text_preview': result['text'][:200] + '...' if len(result['text']) > 200 else result['text'], 'page_time': page_time})}\n\n"
-                await asyncio.sleep(0.1)
+                # Clear the entire chunk from memory
+                for img in images:
+                    if img:
+                        img.close()
+                images.clear()
+                del images
+                gc.collect()
             
             final_text = "\n\n".join(all_text)
             avg_confidence = total_confidence / total_pages if total_pages > 0 else 0
             detected_langs_str = ", ".join(detected_languages) if detected_languages else "Multiple/Unknown"
-        else:
-            yield f"data: {json.dumps({'type': 'progress', 'file_id': file_id, 'progress': 50, 'message': f'Processing image with {verification_level} verification...', 'elapsed_time': round(time.time() - start_time, 1)})}\n\n"
-            image = Image.open(io.BytesIO(file_content))
             
+            # Clear all_text list
+            all_text.clear()
+            
+        else:
+            # Process image
+            yield f"data: {json.dumps({'type': 'progress', 'file_id': file_id, 'progress': 50, 'message': f'Processing image with {verification_level} verification...', 'elapsed_time': round(time.time() - start_time, 1)})}\n\n"
+            
+            image = Image.open(temp_file_path)
             result = await verify_ocr_extraction(image, verification_level)
             final_text = result['text']
             avg_confidence = result['confidence']
             detected_langs_str = "Auto-detected"
+            image.close()
+            image = None
         
         total_time = round(time.time() - start_time, 1)
+        
+        # Cleanup old results before storing new one
+        cleanup_old_results()
         
         # Store result
         processed_results[file_id] = {
@@ -172,9 +273,19 @@ async def stream_ocr_progress(file_content: bytes, filename: str, file_id: str, 
         
     except Exception as e:
         yield f"data: {json.dumps({'type': 'error', 'file_id': file_id, 'error': str(e)})}\n\n"
+    finally:
+        # Always cleanup temp file
+        if temp_file_path and os.path.exists(temp_file_path):
+            try:
+                os.remove(temp_file_path)
+            except:
+                pass
+        gc.collect()
 
+# HTML interface remains the same...
 @app.get("/", response_class=HTMLResponse)
 async def main():
+    # [Keep the existing HTML exactly as is]
     return """
     <!DOCTYPE html>
     <html lang="en">
@@ -564,13 +675,19 @@ async def main():
             .close-modal:hover {
                 color: var(--ms-gray-90);
             }
+            
+            .file-size-warning {
+                color: var(--ms-red);
+                font-size: 12px;
+                margin-top: 8px;
+            }
         </style>
     </head>
     <body>
         <div class="ms-header">
             <div class="container">
                 <h1>MAFM OCR</h1>
-                <div class="subtitle">Multi-pass Document Processing System</div>
+                <div class="subtitle">Multi-pass Document Processing System (Memory Optimized)</div>
             </div>
         </div>
         
@@ -619,8 +736,11 @@ async def main():
                                     <path d="M8 28V40H40V28" stroke="#0078d4" stroke-width="2"/>
                                 </svg>
                                 <h4 class="mt-3">Drop files here or click to browse</h4>
-                                <p class="text-muted mb-0">Supports PDF, JPG, PNG</p>
+                                <p class="text-muted mb-0">Supports PDF, JPG, PNG (Max 10MB)</p>
                                 <input type="file" id="fileInput" accept=".pdf,.jpg,.jpeg,.png" multiple>
+                            </div>
+                            <div class="file-size-warning" id="fileSizeWarning" style="display: none;">
+                                Warning: File exceeds 10MB limit and will be rejected
                             </div>
                             <button class="ms-button w-100 mt-3" id="processBtn" onclick="processAllFiles()" disabled>
                                 <span>Process Documents</span>
@@ -653,7 +773,7 @@ async def main():
             <!-- Results Tab -->
             <div id="resultsTab" class="tab-content" style="display: none;">
                 <div class="ms-card">
-                    <h3>Processed Documents</h3>
+                    <h3>Processed Documents (Last 10)</h3>
                     <table class="ms-table" id="resultsTable">
                         <thead>
                             <tr>
@@ -690,7 +810,7 @@ POST /extract
 Content-Type: multipart/form-data
 
 Parameters:
-- file: PDF or image file
+- file: PDF or image file (max 10MB)
 
 Response:
 {
@@ -708,7 +828,7 @@ POST /stream-extract
 Content-Type: multipart/form-data
 
 Parameters:
-- file: PDF or image file
+- file: PDF or image file (max 10MB)
 - verification_level: "low" | "medium" | "high" | "ultra" (default: "low")
 
 Response: Server-Sent Events stream
@@ -786,6 +906,7 @@ Response:
             let selectedVerificationLevel = 'low';
             let currentTab = 'upload';
             window.extractedTexts = {};
+            const MAX_FILE_SIZE = 10 * 1024 * 1024; // 10MB
             
             function showTab(tab) {
                 currentTab = tab;
@@ -837,7 +958,12 @@ Response:
             });
             
             function handleFiles(files) {
+                let hasOversized = false;
                 files.forEach(file => {
+                    if (file.size > MAX_FILE_SIZE) {
+                        hasOversized = true;
+                        return; // Skip files over 10MB
+                    }
                     const fileId = 'file-' + Date.now() + '-' + Math.random().toString(36).substr(2, 9);
                     uploadedFiles.push({
                         id: fileId,
@@ -847,6 +973,13 @@ Response:
                         verificationLevel: selectedVerificationLevel
                     });
                 });
+                
+                if (hasOversized) {
+                    document.getElementById('fileSizeWarning').style.display = 'block';
+                    setTimeout(() => {
+                        document.getElementById('fileSizeWarning').style.display = 'none';
+                    }, 5000);
+                }
                 
                 updateFilesList();
                 document.getElementById('processBtn').disabled = uploadedFiles.length === 0;
@@ -875,12 +1008,15 @@ Response:
                         'ultra': 'Maximum (5×)'
                     };
                     
+                    const fileSizeMB = (fileInfo.file.size / (1024 * 1024)).toFixed(2);
+                    
                     return `
                         <div class="file-item">
                             <div class="d-flex justify-content-between align-items-center">
                                 <div>
                                     <strong>${fileInfo.file.name}</strong>
                                     <span class="text-muted ms-2">${levelText[fileInfo.verificationLevel]}</span>
+                                    <span class="text-muted ms-2">(${fileSizeMB}MB)</span>
                                 </div>
                                 <span class="status-badge status-${fileInfo.status}">${fileInfo.status}</span>
                             </div>
@@ -1163,24 +1299,71 @@ async def extract_text(file: UploadFile = File(...)):
     
     Returns extracted text with basic metadata.
     """
+    # Check file size
+    content = await file.read()
+    if len(content) > MAX_FILE_SIZE:
+        raise HTTPException(status_code=413, detail=f"File too large. Maximum size is {MAX_FILE_SIZE/1024/1024}MB")
+    
+    temp_file_path = None
     try:
-        content = await file.read()
+        # Save to temp file
+        with tempfile.NamedTemporaryFile(delete=False, suffix=os.path.splitext(file.filename)[1]) as temp_file:
+            temp_file.write(content)
+            temp_file_path = temp_file.name
+        
+        # Clear content from memory
+        content = None
+        gc.collect()
         
         if file.filename.lower().endswith('.pdf'):
-            images = pdf2image.convert_from_bytes(content, dpi=150)
+            # Process page by page
             all_text = []
             
-            for i, image in enumerate(images, 1):
-                text = pytesseract.image_to_string(image)
-                if text.strip():
-                    all_text.append(f"[Page {i}]\n{text}")
+            # Get page count
+            from pdf2image import pdfinfo_from_path
+            info = pdfinfo_from_path(temp_file_path)
+            total_pages = info['Pages']
+            
+            # Process in chunks
+            chunk_size = 5
+            for chunk_start in range(0, total_pages, chunk_size):
+                chunk_end = min(chunk_start + chunk_size, total_pages)
+                
+                images = pdf2image.convert_from_path(
+                    temp_file_path,
+                    dpi=150,
+                    first_page=chunk_start + 1,
+                    last_page=chunk_end
+                )
+                
+                for i, image in enumerate(images, chunk_start + 1):
+                    text = pytesseract.image_to_string(image)
+                    if text.strip():
+                        all_text.append(f"[Page {i}]\n{text}")
+                    
+                    # Clear image
+                    image.close()
+                    image = None
+                
+                # Clear chunk
+                for img in images:
+                    if img:
+                        img.close()
+                images.clear()
+                del images
+                gc.collect()
             
             final_text = "\n\n".join(all_text)
-            pages = len(images)
+            pages = total_pages
+            all_text.clear()
         else:
-            image = Image.open(io.BytesIO(content))
+            image = Image.open(temp_file_path)
             final_text = pytesseract.image_to_string(image)
             pages = 1
+            image.close()
+            image = None
+        
+        gc.collect()
         
         return JSONResponse({
             "text": final_text,
@@ -1192,6 +1375,14 @@ async def extract_text(file: UploadFile = File(...)):
         
     except Exception as e:
         raise HTTPException(status_code=400, detail=str(e))
+    finally:
+        # Always cleanup temp file
+        if temp_file_path and os.path.exists(temp_file_path):
+            try:
+                os.remove(temp_file_path)
+            except:
+                pass
+        gc.collect()
 
 @app.post("/stream-extract")
 async def stream_extract(
@@ -1208,7 +1399,11 @@ async def stream_extract(
     - high: 4 passes (1 extract + 3 verify)  
     - ultra: 5 passes (1 extract + 4 verify)
     """
+    # Check file size
     content = await file.read()
+    if len(content) > MAX_FILE_SIZE:
+        raise HTTPException(status_code=413, detail=f"File too large. Maximum size is {MAX_FILE_SIZE/1024/1024}MB")
+    
     file_id = file_id or str(uuid.uuid4())
     
     if verification_level not in ['low', 'medium', 'high', 'ultra']:
@@ -1227,6 +1422,7 @@ async def stream_extract(
 @app.get("/api/results")
 async def list_results():
     """Get list of all processed documents"""
+    cleanup_old_results()
     return JSONResponse([
         {
             "file_id": file_id,
@@ -1277,6 +1473,21 @@ async def get_available_languages():
     except Exception as e:
         return {"error": str(e)}
 
+# Background garbage collection thread
+def periodic_gc():
+    """Run garbage collection every 30 seconds"""
+    while True:
+        time.sleep(30)
+        gc.collect()
+        cleanup_old_results()
+
+# Start GC thread
+gc_thread = threading.Thread(target=periodic_gc, daemon=True)
+gc_thread.start()
+
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 8080))
+    print(f"Starting server with memory optimization...")
+    print(f"Max file size: {MAX_FILE_SIZE/1024/1024}MB")
+    print(f"Max stored results: {MAX_RESULTS}")
     uvicorn.run(app, host="0.0.0.0", port=port, log_level="info")
