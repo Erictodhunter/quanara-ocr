@@ -19,6 +19,7 @@ import tempfile
 import shutil
 import resource
 import threading
+import re
 
 # Memory management setup
 try:
@@ -47,6 +48,40 @@ MAX_RESULTS = 10  # Limit stored results to prevent memory overflow
 # Maximum file size: 10MB
 MAX_FILE_SIZE = 10 * 1024 * 1024
 
+def clean_text_for_json(text):
+    """Clean OCR text to be JSON-safe and remove problematic characters"""
+    if not text:
+        return ""
+    
+    # Remove control characters (0x00-0x1F, 0x7F-0x9F)
+    text = re.sub(r'[\x00-\x1F\x7F-\x9F]', ' ', text)
+    
+    # Replace problematic characters for JSON
+    text = text.replace('"', "'")  # Replace double quotes with single quotes
+    text = text.replace('\\', '/')  # Replace backslashes with forward slashes
+    text = text.replace('\b', ' ')  # Replace backspace
+    text = text.replace('\f', ' ')  # Replace form feed
+    text = text.replace('\v', ' ')  # Replace vertical tab
+    
+    # Remove non-printable Unicode characters
+    text = re.sub(r'[\u0000-\u001F\u007F-\u009F]', ' ', text)
+    
+    # Remove zero-width characters and other problematic Unicode
+    text = re.sub(r'[\u200B-\u200D\uFEFF]', '', text)
+    
+    # Keep only ASCII printable characters, basic punctuation, and whitespace
+    text = re.sub(r'[^\x20-\x7E\n\r\t]', ' ', text)
+    
+    # Normalize whitespace - collapse multiple spaces/newlines but preserve structure
+    text = re.sub(r'\n\s*\n', '\n\n', text)  # Preserve paragraph breaks
+    text = re.sub(r'[ \t]+', ' ', text)      # Collapse horizontal whitespace
+    text = re.sub(r'\n{3,}', '\n\n', text)   # Limit consecutive newlines
+    
+    # Remove any remaining problematic sequences
+    text = text.replace('\x00', '')  # Remove null bytes
+    
+    return text.strip()
+
 def detect_language_from_text(text):
     """Fast language detection based on common words - no external library needed"""
     # Only check first 1000 chars for speed
@@ -72,7 +107,7 @@ def detect_language_from_text(text):
             language_scores['spanish'] += 1
     
     # French indicators
-    french_words = ['contrat', 'location', 'locataire', 'date', 'mois', 'année', 'le', 'la', 'de', 'que', 'et', 'les', 'avec', 'pour', 'par']
+    french_words = ['contrat', 'location', 'locataire', 'bailleur', 'date', 'mois', 'année', 'le', 'la', 'de', 'que', 'et', 'les', 'avec', 'pour', 'par']
     for word in french_words:
         if word in sample:
             language_scores['french'] += 1
@@ -304,8 +339,9 @@ async def stream_ocr_progress(file_content: bytes, filename: str, file_id: str, 
             final_text = "\n\n".join(all_text)
             avg_confidence = total_confidence / total_pages if total_pages > 0 else 0
             
-            # Detect language from the extracted text
-            detected_language = detect_language_from_text(final_text)
+            # Clean the text and detect language from the cleaned text
+            cleaned_text = clean_text_for_json(final_text)
+            detected_language = detect_language_from_text(cleaned_text)
             
             # Clear all_text list
             all_text.clear()
@@ -319,8 +355,9 @@ async def stream_ocr_progress(file_content: bytes, filename: str, file_id: str, 
             final_text = result['text']
             avg_confidence = result['confidence']
             
-            # Detect language from the extracted text
-            detected_language = detect_language_from_text(final_text)
+            # Clean the text and detect language from the cleaned text
+            cleaned_text = clean_text_for_json(final_text)
+            detected_language = detect_language_from_text(cleaned_text)
             
             image.close()
             image = None
@@ -330,19 +367,19 @@ async def stream_ocr_progress(file_content: bytes, filename: str, file_id: str, 
         # Cleanup old results before storing new one
         cleanup_old_results()
         
-        # Store result
+        # Store result with cleaned text
         processed_results[file_id] = {
             'filename': filename,
-            'text': final_text,
+            'text': cleaned_text,
             'confidence': avg_confidence,
             'verification_level': verification_level,
             'detected_languages': detected_language,
             'total_time': total_time,
             'timestamp': datetime.now().isoformat(),
-            'character_count': len(final_text)
+            'character_count': len(cleaned_text)
         }
         
-        yield f"data: {json.dumps({'type': 'complete', 'file_id': file_id, 'text': final_text, 'total_chars': len(final_text), 'average_confidence': avg_confidence, 'verification_level': verification_level, 'detected_languages': detected_language, 'message': f'Processing complete! Average confidence: {avg_confidence:.1f}%', 'total_time': total_time})}\n\n"
+        yield f"data: {json.dumps({'type': 'complete', 'file_id': file_id, 'text': cleaned_text, 'total_chars': len(cleaned_text), 'average_confidence': avg_confidence, 'verification_level': verification_level, 'detected_languages': detected_language, 'message': f'Processing complete! Average confidence: {avg_confidence:.1f}%', 'total_time': total_time})}\n\n"
         
     except Exception as e:
         yield f"data: {json.dumps({'type': 'error', 'file_id': file_id, 'error': str(e)})}\n\n"
@@ -358,8 +395,150 @@ async def stream_ocr_progress(file_content: bytes, filename: str, file_id: str, 
 # HTML interface remains the same (keeping it as is - too long to include)
 @app.get("/", response_class=HTMLResponse)
 async def main():
-    # [HTML content omitted for brevity - use the same HTML as before]
-    return """<!DOCTYPE html>... [same HTML as before] ...</html>"""
+    return """<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>MAFM OCR API</title>
+    <style>
+        body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; margin: 0; padding: 20px; background: #f5f5f5; }
+        .container { max-width: 800px; margin: 0 auto; background: white; padding: 30px; border-radius: 10px; box-shadow: 0 2px 10px rgba(0,0,0,0.1); }
+        h1 { color: #333; text-align: center; }
+        .upload-area { border: 2px dashed #ddd; padding: 40px; text-align: center; border-radius: 10px; margin: 20px 0; }
+        .upload-area.drag-over { border-color: #007bff; background: #f0f8ff; }
+        input[type="file"] { display: none; }
+        .btn { background: #007bff; color: white; padding: 12px 24px; border: none; border-radius: 5px; cursor: pointer; margin: 10px; }
+        .btn:hover { background: #0056b3; }
+        .progress { width: 100%; height: 20px; background: #f0f0f0; border-radius: 10px; overflow: hidden; margin: 10px 0; }
+        .progress-bar { height: 100%; background: #007bff; transition: width 0.3s; }
+        .result { margin: 20px 0; padding: 20px; background: #f8f9fa; border-radius: 5px; }
+        .hidden { display: none; }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <h1>MAFM OCR API v4.3.0</h1>
+        <p>Upload PDF or image files for text extraction with multi-pass verification.</p>
+        
+        <div class="upload-area" id="uploadArea">
+            <p>Drag and drop files here or click to select</p>
+            <input type="file" id="fileInput" accept=".pdf,.png,.jpg,.jpeg,.tiff,.bmp" multiple>
+            <button class="btn" onclick="document.getElementById('fileInput').click()">Select Files</button>
+        </div>
+        
+        <div>
+            <label>Verification Level:</label>
+            <select id="verificationLevel">
+                <option value="low">Low (1 pass - fastest)</option>
+                <option value="medium">Medium (2 passes)</option>
+                <option value="high">High (3 passes)</option>
+                <option value="ultra">Ultra (4 passes - most accurate)</option>
+            </select>
+        </div>
+        
+        <div id="results"></div>
+    </div>
+
+    <script>
+        const uploadArea = document.getElementById('uploadArea');
+        const fileInput = document.getElementById('fileInput');
+        const results = document.getElementById('results');
+        
+        uploadArea.addEventListener('dragover', (e) => {
+            e.preventDefault();
+            uploadArea.classList.add('drag-over');
+        });
+        
+        uploadArea.addEventListener('dragleave', () => {
+            uploadArea.classList.remove('drag-over');
+        });
+        
+        uploadArea.addEventListener('drop', (e) => {
+            e.preventDefault();
+            uploadArea.classList.remove('drag-over');
+            handleFiles(e.dataTransfer.files);
+        });
+        
+        fileInput.addEventListener('change', (e) => {
+            handleFiles(e.target.files);
+        });
+        
+        function handleFiles(files) {
+            Array.from(files).forEach(file => processFile(file));
+        }
+        
+        function processFile(file) {
+            const fileId = Date.now() + '_' + Math.random().toString(36).substr(2, 9);
+            const verificationLevel = document.getElementById('verificationLevel').value;
+            
+            const resultDiv = document.createElement('div');
+            resultDiv.className = 'result';
+            resultDiv.innerHTML = `
+                <h3>${file.name}</h3>
+                <div class="progress">
+                    <div class="progress-bar" id="progress-${fileId}"></div>
+                </div>
+                <div id="status-${fileId}">Starting...</div>
+                <div id="text-${fileId}" class="hidden"></div>
+            `;
+            results.appendChild(resultDiv);
+            
+            const formData = new FormData();
+            formData.append('file', file);
+            formData.append('file_id', fileId);
+            formData.append('verification_level', verificationLevel);
+            
+            fetch('/stream-extract', {
+                method: 'POST',
+                body: formData
+            }).then(response => {
+                const reader = response.body.getReader();
+                
+                function readStream() {
+                    reader.read().then(({ done, value }) => {
+                        if (done) return;
+                        
+                        const text = new TextDecoder().decode(value);
+                        const lines = text.split('\n');
+                        
+                        lines.forEach(line => {
+                            if (line.startsWith('data: ')) {
+                                try {
+                                    const data = JSON.parse(line.substring(6));
+                                    updateProgress(fileId, data);
+                                } catch (e) {}
+                            }
+                        });
+                        
+                        readStream();
+                    });
+                }
+                
+                readStream();
+            });
+        }
+        
+        function updateProgress(fileId, data) {
+            const progressBar = document.getElementById(`progress-${fileId}`);
+            const status = document.getElementById(`status-${fileId}`);
+            const textDiv = document.getElementById(`text-${fileId}`);
+            
+            if (data.type === 'progress') {
+                progressBar.style.width = data.progress + '%';
+                status.textContent = data.message;
+            } else if (data.type === 'complete') {
+                progressBar.style.width = '100%';
+                status.innerHTML = `✅ ${data.message}`;
+                textDiv.innerHTML = `<h4>Extracted Text (${data.total_chars} characters):</h4><pre style="white-space: pre-wrap; background: white; padding: 15px; border-radius: 5px; border: 1px solid #ddd;">${data.text}</pre>`;
+                textDiv.classList.remove('hidden');
+            } else if (data.type === 'error') {
+                status.innerHTML = `❌ Error: ${data.error}`;
+            }
+        }
+    </script>
+</body>
+</html>"""
 
 @app.post("/extract")
 async def extract_text(file: UploadFile = File(...)):
@@ -432,17 +611,20 @@ async def extract_text(file: UploadFile = File(...)):
             image.close()
             image = None
         
+        # Clean the text for JSON safety
+        cleaned_text = clean_text_for_json(final_text)
+        
         # Detect the actual language using fast method
-        detected_language = detect_language_from_text(final_text)
+        detected_language = detect_language_from_text(cleaned_text)
         
         gc.collect()
         
         return JSONResponse({
-            "text": final_text,
+            "text": cleaned_text,
             "pages": pages,
             "filename": file.filename,
-            "character_count": len(final_text),
-            "language_detection": detected_language  # Now returns actual language!
+            "character_count": len(cleaned_text),
+            "language_detection": detected_language
         })
         
     except Exception as e:
@@ -559,8 +741,9 @@ gc_thread.start()
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 8080))
-    print(f"Starting server with memory optimization and fast language detection...")
+    print(f"Starting server with memory optimization and JSON-safe text cleaning...")
     print(f"Max file size: {MAX_FILE_SIZE/1024/1024}MB")
     print(f"Max stored results: {MAX_RESULTS}")
     print(f"Verification levels: low=1 pass, medium=2 passes, high=3 passes, ultra=4 passes")
+    print(f"Text cleaning: Removes control characters, normalizes whitespace, ensures JSON safety")
     uvicorn.run(app, host="0.0.0.0", port=port, log_level="info")
