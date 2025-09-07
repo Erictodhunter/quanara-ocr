@@ -33,8 +33,8 @@ gc.set_threshold(100, 5, 5)
 
 app = FastAPI(
     title="MAFM OCR API",
-    description="Multi-pass OCR verification system for lease document processing",
-    version="4.3.0",
+    description="Multi-pass OCR verification system for lease document processing with Modal integration",
+    version="5.0.0",
     docs_url="/api/docs",
     redoc_url="/api/redoc"
 )
@@ -271,7 +271,7 @@ async def stream_ocr_progress(file_content: bytes, filename: str, file_id: str, 
         
         if filename.lower().endswith('.pdf'):
             # Process PDF page by page to avoid loading all pages in memory
-            all_text = []
+            page_texts = []  # Store page-by-page results for Modal format
             total_confidence = 0
             detected_languages = set()
             
@@ -310,13 +310,20 @@ async def stream_ocr_progress(file_content: bytes, filename: str, file_id: str, 
                     
                     result = await verify_ocr_extraction(image, verification_level)
                     
-                    if result['text'].strip():
-                        all_text.append(f"[Page {i}]\n{result['text']}")
+                    # Clean the text for this page
+                    cleaned_page_text = clean_text_for_json(result['text'])
+                    
+                    if cleaned_page_text.strip():
+                        # Store in Modal format: {"page": number, "text": "content"}
+                        page_texts.append({
+                            "page": i,
+                            "text": cleaned_page_text
+                        })
                     
                     total_confidence += result['confidence']
                     page_time = round(time.time() - page_start_time, 1)
                     
-                    yield f"data: {json.dumps({'type': 'page_complete', 'file_id': file_id, 'page': i, 'confidence': result['confidence'], 'passes': result['passes'], 'variations': result['variations'], 'text_preview': result['text'][:200] + '...' if len(result['text']) > 200 else result['text'], 'page_time': page_time})}\n\n"
+                    yield f"data: {json.dumps({'type': 'page_complete', 'file_id': file_id, 'page': i, 'confidence': result['confidence'], 'passes': result['passes'], 'variations': result['variations'], 'text_preview': cleaned_page_text[:200] + '...' if len(cleaned_page_text) > 200 else cleaned_page_text, 'page_time': page_time})}\n\n"
                     
                     # Clear image from memory immediately
                     image.close()
@@ -336,15 +343,11 @@ async def stream_ocr_progress(file_content: bytes, filename: str, file_id: str, 
                 del images
                 gc.collect()
             
-            final_text = "\n\n".join(all_text)
             avg_confidence = total_confidence / total_pages if total_pages > 0 else 0
             
-            # Clean the text and detect language from the cleaned text
-            cleaned_text = clean_text_for_json(final_text)
-            detected_language = detect_language_from_text(cleaned_text)
-            
-            # Clear all_text list
-            all_text.clear()
+            # Detect language from combined text
+            combined_text = " ".join([page["text"] for page in page_texts])
+            detected_language = detect_language_from_text(combined_text)
             
         else:
             # Process image
@@ -352,11 +355,15 @@ async def stream_ocr_progress(file_content: bytes, filename: str, file_id: str, 
             
             image = Image.open(temp_file_path)
             result = await verify_ocr_extraction(image, verification_level)
-            final_text = result['text']
+            
+            # Clean the text
+            cleaned_text = clean_text_for_json(result['text'])
+            
+            # Format as single page for Modal
+            page_texts = [{"page": 1, "text": cleaned_text}]
             avg_confidence = result['confidence']
             
-            # Clean the text and detect language from the cleaned text
-            cleaned_text = clean_text_for_json(final_text)
+            # Detect language from the cleaned text
             detected_language = detect_language_from_text(cleaned_text)
             
             image.close()
@@ -367,19 +374,23 @@ async def stream_ocr_progress(file_content: bytes, filename: str, file_id: str, 
         # Cleanup old results before storing new one
         cleanup_old_results()
         
-        # Store result with cleaned text
+        # Store result with page format for Modal
         processed_results[file_id] = {
             'filename': filename,
-            'text': cleaned_text,
+            'ocr_pages': page_texts,  # This is the key format Modal expects
             'confidence': avg_confidence,
             'verification_level': verification_level,
-            'detected_languages': detected_language,
+            'detected_language': detected_language,
             'total_time': total_time,
             'timestamp': datetime.now().isoformat(),
-            'character_count': len(cleaned_text)
+            'total_pages': len(page_texts),
+            'character_count': sum(len(page["text"]) for page in page_texts)
         }
         
-        yield f"data: {json.dumps({'type': 'complete', 'file_id': file_id, 'text': cleaned_text, 'total_chars': len(cleaned_text), 'average_confidence': avg_confidence, 'verification_level': verification_level, 'detected_languages': detected_language, 'message': f'Processing complete! Average confidence: {avg_confidence:.1f}%', 'total_time': total_time})}\n\n"
+        # Calculate total characters
+        total_chars = sum(len(page["text"]) for page in page_texts)
+        
+        yield f"data: {json.dumps({'type': 'complete', 'file_id': file_id, 'ocr_pages': page_texts, 'total_chars': total_chars, 'average_confidence': avg_confidence, 'verification_level': verification_level, 'detected_language': detected_language, 'message': f'Processing complete! Average confidence: {avg_confidence:.1f}%', 'total_time': total_time})}\n\n"
         
     except Exception as e:
         yield f"data: {json.dumps({'type': 'error', 'file_id': file_id, 'error': str(e)})}\n\n"
@@ -392,7 +403,128 @@ async def stream_ocr_progress(file_content: bytes, filename: str, file_id: str, 
                 pass
         gc.collect()
 
-# HTML interface remains the same (keeping it as is - too long to include)
+# NEW ENDPOINT FOR MODAL INTEGRATION
+@app.post("/extract-for-modal")
+async def extract_for_modal(file: UploadFile = File(...), verification_level: str = Form('medium')):
+    """
+    Extract text in the exact format that Modal Hunyuan system expects.
+    
+    Returns: {
+        "ocr_pages": [{"page": 1, "text": "content"}, {"page": 2, "text": "content"}],
+        "filename": "document.pdf",
+        "metadata": {...}
+    }
+    """
+    # Check file size
+    content = await file.read()
+    if len(content) > MAX_FILE_SIZE:
+        raise HTTPException(status_code=413, detail=f"File too large. Maximum size is {MAX_FILE_SIZE/1024/1024}MB")
+    
+    temp_file_path = None
+    try:
+        # Save to temp file
+        with tempfile.NamedTemporaryFile(delete=False, suffix=os.path.splitext(file.filename)[1]) as temp_file:
+            temp_file.write(content)
+            temp_file_path = temp_file.name
+        
+        # Clear content from memory
+        content = None
+        gc.collect()
+        
+        page_texts = []
+        total_confidence = 0
+        
+        if file.filename.lower().endswith('.pdf'):
+            # Process page by page
+            from pdf2image import pdfinfo_from_path
+            info = pdfinfo_from_path(temp_file_path)
+            total_pages = info['Pages']
+            
+            # Process in chunks
+            chunk_size = 5
+            for chunk_start in range(0, total_pages, chunk_size):
+                chunk_end = min(chunk_start + chunk_size, total_pages)
+                
+                images = pdf2image.convert_from_path(
+                    temp_file_path,
+                    dpi=150,
+                    first_page=chunk_start + 1,
+                    last_page=chunk_end
+                )
+                
+                for i, image in enumerate(images, chunk_start + 1):
+                    # Run OCR with verification
+                    result = await verify_ocr_extraction(image, verification_level)
+                    
+                    # Clean the text
+                    cleaned_text = clean_text_for_json(result['text'])
+                    
+                    if cleaned_text.strip():
+                        page_texts.append({
+                            "page": i,
+                            "text": cleaned_text
+                        })
+                    
+                    total_confidence += result['confidence']
+                    
+                    # Clear image
+                    image.close()
+                    image = None
+                
+                # Clear chunk
+                for img in images:
+                    if img:
+                        img.close()
+                images.clear()
+                del images
+                gc.collect()
+            
+            avg_confidence = total_confidence / total_pages if total_pages > 0 else 0
+        else:
+            # Process single image
+            image = Image.open(temp_file_path)
+            result = await verify_ocr_extraction(image, verification_level)
+            
+            cleaned_text = clean_text_for_json(result['text'])
+            
+            page_texts = [{"page": 1, "text": cleaned_text}]
+            avg_confidence = result['confidence']
+            
+            image.close()
+            image = None
+        
+        # Detect language from combined text
+        combined_text = " ".join([page["text"] for page in page_texts])
+        detected_language = detect_language_from_text(combined_text)
+        
+        gc.collect()
+        
+        # Return in EXACT format Modal expects
+        return JSONResponse({
+            "ocr_pages": page_texts,
+            "filename": file.filename,
+            "metadata": {
+                "ocr_confidence": avg_confidence,
+                "verification_level": verification_level,
+                "detected_language": detected_language,
+                "total_pages": len(page_texts),
+                "character_count": sum(len(page["text"]) for page in page_texts),
+                "processing_timestamp": datetime.now().isoformat()
+            }
+        })
+        
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    finally:
+        # Always cleanup temp file
+        if temp_file_path and os.path.exists(temp_file_path):
+            try:
+                os.remove(temp_file_path)
+            except:
+                pass
+        gc.collect()
+
+# Keep all your existing endpoints...
 @app.get("/", response_class=HTMLResponse)
 async def main():
     return """<!DOCTYPE html>
@@ -400,7 +532,7 @@ async def main():
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>MAFM OCR API</title>
+    <title>MAFM OCR API v5.0 - Modal Integration</title>
     <style>
         body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; margin: 0; padding: 20px; background: #f5f5f5; }
         .container { max-width: 800px; margin: 0 auto; background: white; padding: 30px; border-radius: 10px; box-shadow: 0 2px 10px rgba(0,0,0,0.1); }
@@ -414,12 +546,19 @@ async def main():
         .progress-bar { height: 100%; background: #007bff; transition: width 0.3s; }
         .result { margin: 20px 0; padding: 20px; background: #f8f9fa; border-radius: 5px; }
         .hidden { display: none; }
+        .modal-format { background: #e8f5e8; border: 1px solid #28a745; padding: 15px; border-radius: 5px; margin: 10px 0; }
     </style>
 </head>
 <body>
     <div class="container">
-        <h1>MAFM OCR API v4.3.0</h1>
-        <p>Upload PDF or image files for text extraction with multi-pass verification.</p>
+        <h1>MAFM OCR API v5.0</h1>
+        <p>Upload PDF or image files for text extraction with Modal Hunyuan integration.</p>
+        
+        <div class="modal-format">
+            <h3>✅ Modal Integration Ready</h3>
+            <p>This OCR system outputs the exact format needed for your Hunyuan translation system.</p>
+            <p><strong>Endpoint:</strong> <code>/extract-for-modal</code></p>
+        </div>
         
         <div class="upload-area" id="uploadArea">
             <p>Drag and drop files here or click to select</p>
@@ -431,7 +570,7 @@ async def main():
             <label>Verification Level:</label>
             <select id="verificationLevel">
                 <option value="low">Low (1 pass - fastest)</option>
-                <option value="medium">Medium (2 passes)</option>
+                <option value="medium" selected>Medium (2 passes - recommended)</option>
                 <option value="high">High (3 passes)</option>
                 <option value="ultra">Ultra (4 passes - most accurate)</option>
             </select>
@@ -530,7 +669,14 @@ async def main():
             } else if (data.type === 'complete') {
                 progressBar.style.width = '100%';
                 status.innerHTML = `✅ ${data.message}`;
-                textDiv.innerHTML = `<h4>Extracted Text (${data.total_chars} characters):</h4><pre style="white-space: pre-wrap; background: white; padding: 15px; border-radius: 5px; border: 1px solid #ddd;">${data.text}</pre>`;
+                
+                // Show Modal format
+                const modalFormat = data.ocr_pages ? JSON.stringify(data.ocr_pages, null, 2) : 'No page data';
+                textDiv.innerHTML = `
+                    <h4>Modal Format Output:</h4>
+                    <pre style="white-space: pre-wrap; background: #e8f5e8; padding: 15px; border-radius: 5px; border: 1px solid #28a745; max-height: 300px; overflow-y: auto;">${modalFormat}</pre>
+                    <p><strong>Ready for Modal Hunyuan processing!</strong></p>
+                `;
                 textDiv.classList.remove('hidden');
             } else if (data.type === 'error') {
                 status.innerHTML = `❌ Error: ${data.error}`;
@@ -741,9 +887,9 @@ gc_thread.start()
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 8080))
-    print(f"Starting server with memory optimization and JSON-safe text cleaning...")
+    print(f"Starting server with Modal integration...")
     print(f"Max file size: {MAX_FILE_SIZE/1024/1024}MB")
     print(f"Max stored results: {MAX_RESULTS}")
     print(f"Verification levels: low=1 pass, medium=2 passes, high=3 passes, ultra=4 passes")
-    print(f"Text cleaning: Removes control characters, normalizes whitespace, ensures JSON safety")
+    print(f"NEW: /extract-for-modal endpoint - outputs format for Hunyuan processing")
     uvicorn.run(app, host="0.0.0.0", port=port, log_level="info")
