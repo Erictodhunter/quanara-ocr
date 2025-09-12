@@ -20,6 +20,8 @@ import shutil
 import resource
 import threading
 import re
+import requests
+from typing import Optional
 
 # Memory management setup
 try:
@@ -34,7 +36,7 @@ gc.set_threshold(100, 5, 5)
 app = FastAPI(
     title="MAFM OCR API",
     description="Multi-pass OCR verification system for lease document processing with Modal integration",
-    version="5.0.0",
+    version="5.1.0",
     docs_url="/api/docs",
     redoc_url="/api/redoc"
 )
@@ -251,6 +253,55 @@ async def verify_ocr_extraction(image, verification_level):
         'variations': num_passes
     }
 
+async def download_file_from_url(url: str) -> tuple[bytes, str]:
+    """Download file from URL and return content and filename"""
+    try:
+        # Add timeout and stream for large files
+        response = requests.get(url, timeout=30, stream=True)
+        response.raise_for_status()
+        
+        # Get filename from URL or headers
+        filename = None
+        if 'content-disposition' in response.headers:
+            # Try to extract filename from content-disposition header
+            cd = response.headers['content-disposition']
+            if 'filename=' in cd:
+                filename = cd.split('filename=')[-1].strip('"\'')
+        
+        if not filename:
+            # Extract from URL
+            filename = url.split('/')[-1].split('?')[0] or 'document.pdf'
+            # Ensure it has an extension
+            if '.' not in filename:
+                # Try to guess from content-type
+                content_type = response.headers.get('content-type', '')
+                if 'pdf' in content_type:
+                    filename += '.pdf'
+                elif 'image' in content_type:
+                    filename += '.jpg'
+                else:
+                    filename += '.pdf'  # Default to PDF
+        
+        # Download content
+        chunks = []
+        size = 0
+        for chunk in response.iter_content(chunk_size=8192):
+            size += len(chunk)
+            if size > MAX_FILE_SIZE:
+                raise HTTPException(
+                    status_code=413, 
+                    detail=f"File too large. Maximum size is {MAX_FILE_SIZE/1024/1024}MB"
+                )
+            chunks.append(chunk)
+        
+        content = b''.join(chunks)
+        return content, filename
+        
+    except requests.exceptions.RequestException as e:
+        raise HTTPException(status_code=400, detail=f"Failed to download file from URL: {str(e)}")
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=f"Error processing URL: {str(e)}")
+
 async def stream_ocr_progress(file_content: bytes, filename: str, file_id: str, verification_level: str = 'low'):
     """Stream OCR progress with verification passes"""
     temp_file_path = None
@@ -405,9 +456,14 @@ async def stream_ocr_progress(file_content: bytes, filename: str, file_id: str, 
 
 # NEW ENDPOINT FOR MODAL INTEGRATION
 @app.post("/extract-for-modal")
-async def extract_for_modal(file: UploadFile = File(...), verification_level: str = Form('medium')):
+async def extract_for_modal(
+    file: UploadFile = File(None), 
+    file_url: Optional[str] = Form(None),
+    verification_level: str = Form('medium')
+):
     """
     Extract text in the exact format that Modal Hunyuan system expects.
+    Can accept either a file upload or a file URL.
     
     Returns: {
         "ocr_pages": [{"page": 1, "text": "content"}, {"page": 2, "text": "content"}],
@@ -415,15 +471,23 @@ async def extract_for_modal(file: UploadFile = File(...), verification_level: st
         "metadata": {...}
     }
     """
+    # Get content from either file upload or URL
+    if file_url and not file:
+        content, filename = await download_file_from_url(file_url)
+    elif file:
+        content = await file.read()
+        filename = file.filename
+    else:
+        raise HTTPException(status_code=400, detail="Either file or file_url must be provided")
+    
     # Check file size
-    content = await file.read()
     if len(content) > MAX_FILE_SIZE:
         raise HTTPException(status_code=413, detail=f"File too large. Maximum size is {MAX_FILE_SIZE/1024/1024}MB")
     
     temp_file_path = None
     try:
         # Save to temp file
-        with tempfile.NamedTemporaryFile(delete=False, suffix=os.path.splitext(file.filename)[1]) as temp_file:
+        with tempfile.NamedTemporaryFile(delete=False, suffix=os.path.splitext(filename)[1]) as temp_file:
             temp_file.write(content)
             temp_file_path = temp_file.name
         
@@ -434,7 +498,7 @@ async def extract_for_modal(file: UploadFile = File(...), verification_level: st
         page_texts = []
         total_confidence = 0
         
-        if file.filename.lower().endswith('.pdf'):
+        if filename.lower().endswith('.pdf'):
             # Process page by page
             from pdf2image import pdfinfo_from_path
             info = pdfinfo_from_path(temp_file_path)
@@ -502,7 +566,7 @@ async def extract_for_modal(file: UploadFile = File(...), verification_level: st
         # Return in EXACT format Modal expects
         return JSONResponse({
             "ocr_pages": page_texts,
-            "filename": file.filename,
+            "filename": filename,
             "metadata": {
                 "ocr_confidence": avg_confidence,
                 "verification_level": verification_level,
@@ -524,7 +588,177 @@ async def extract_for_modal(file: UploadFile = File(...), verification_level: st
                 pass
         gc.collect()
 
-# Keep all your existing endpoints...
+# Updated extract endpoint with URL support
+@app.post("/extract")
+async def extract_text(
+    file: UploadFile = File(None),
+    file_url: Optional[str] = Form(None)
+):
+    """
+    Simple text extraction from PDF or image files.
+    Can accept either a file upload or a file URL.
+    
+    Returns: {
+        "pages": [{"page_number": 1, "text": "content"}, ...],
+        "filename": "document.pdf",
+        "page_count": 5,
+        "character_count": 12345,
+        "language_detection": "english"
+    }
+    """
+    # Get content from either file upload or URL
+    if file_url and not file:
+        content, filename = await download_file_from_url(file_url)
+    elif file:
+        content = await file.read()
+        filename = file.filename
+    else:
+        raise HTTPException(status_code=400, detail="Either file or file_url must be provided")
+    
+    # Check file size
+    if len(content) > MAX_FILE_SIZE:
+        raise HTTPException(status_code=413, detail=f"File too large. Maximum size is {MAX_FILE_SIZE/1024/1024}MB")
+    
+    temp_file_path = None
+    try:
+        # Save to temp file
+        with tempfile.NamedTemporaryFile(delete=False, suffix=os.path.splitext(filename)[1]) as temp_file:
+            temp_file.write(content)
+            temp_file_path = temp_file.name
+        
+        # Clear content from memory
+        content = None
+        gc.collect()
+        
+        pages = []
+        
+        if filename.lower().endswith('.pdf'):
+            # Process page by page
+            # Get page count
+            from pdf2image import pdfinfo_from_path
+            info = pdfinfo_from_path(temp_file_path)
+            total_pages = info['Pages']
+            
+            # Process in chunks
+            chunk_size = 5
+            for chunk_start in range(0, total_pages, chunk_size):
+                chunk_end = min(chunk_start + chunk_size, total_pages)
+                
+                images = pdf2image.convert_from_path(
+                    temp_file_path,
+                    dpi=150,
+                    first_page=chunk_start + 1,
+                    last_page=chunk_end
+                )
+                
+                for i, image in enumerate(images, chunk_start + 1):
+                    text = pytesseract.image_to_string(image)
+                    cleaned_text = clean_text_for_json(text)
+                    
+                    if cleaned_text.strip():
+                        pages.append({
+                            "page_number": i,
+                            "text": cleaned_text
+                        })
+                    
+                    # Clear image
+                    image.close()
+                    image = None
+                
+                # Clear chunk
+                for img in images:
+                    if img:
+                        img.close()
+                images.clear()
+                del images
+                gc.collect()
+            
+        else:
+            image = Image.open(temp_file_path)
+            text = pytesseract.image_to_string(image)
+            cleaned_text = clean_text_for_json(text)
+            
+            pages = [{
+                "page_number": 1,
+                "text": cleaned_text
+            }]
+            
+            image.close()
+            image = None
+        
+        # Combine all text for language detection
+        combined_text = " ".join([page["text"] for page in pages])
+        detected_language = detect_language_from_text(combined_text)
+        
+        # Calculate total characters
+        total_chars = sum(len(page["text"]) for page in pages)
+        
+        gc.collect()
+        
+        return JSONResponse({
+            "pages": pages,
+            "filename": filename,
+            "page_count": len(pages),
+            "character_count": total_chars,
+            "language_detection": detected_language
+        })
+        
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    finally:
+        # Always cleanup temp file
+        if temp_file_path and os.path.exists(temp_file_path):
+            try:
+                os.remove(temp_file_path)
+            except:
+                pass
+        gc.collect()
+
+@app.post("/stream-extract")
+async def stream_extract(
+    file: UploadFile = File(None), 
+    file_url: Optional[str] = Form(None),
+    file_id: str = Form(None),
+    verification_level: str = Form('low')
+):
+    """
+    Stream text extraction with real-time progress and multi-pass verification.
+    Can accept either a file upload or a file URL.
+    
+    CURRENT VERIFICATION LEVELS:
+    - low: 1 pass (single extraction for speed)
+    - medium: 2 passes (extract + verify)
+    - high: 3 passes (extract + 2 verify)  
+    - ultra: 4 passes (extract + 3 verify)
+    """
+    # Get content from either file upload or URL
+    if file_url and not file:
+        content, filename = await download_file_from_url(file_url)
+    elif file:
+        content = await file.read()
+        filename = file.filename
+    else:
+        raise HTTPException(status_code=400, detail="Either file or file_url must be provided")
+    
+    # Check file size
+    if len(content) > MAX_FILE_SIZE:
+        raise HTTPException(status_code=413, detail=f"File too large. Maximum size is {MAX_FILE_SIZE/1024/1024}MB")
+    
+    file_id = file_id or str(uuid.uuid4())
+    
+    if verification_level not in ['low', 'medium', 'high', 'ultra']:
+        verification_level = 'low'
+    
+    return StreamingResponse(
+        stream_ocr_progress(content, filename, file_id, verification_level),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "Connection": "keep-alive",
+            "X-Accel-Buffering": "no"
+        }
+    )
+
 @app.get("/", response_class=HTMLResponse)
 async def main():
     return """<!DOCTYPE html>
@@ -532,7 +766,7 @@ async def main():
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>MAFM OCR API v5.0 - Modal Integration</title>
+    <title>MAFM OCR API v5.1 - Modal Integration with URL Support</title>
     <style>
         body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; margin: 0; padding: 20px; background: #f5f5f5; }
         .container { max-width: 800px; margin: 0 auto; background: white; padding: 30px; border-radius: 10px; box-shadow: 0 2px 10px rgba(0,0,0,0.1); }
@@ -547,23 +781,41 @@ async def main():
         .result { margin: 20px 0; padding: 20px; background: #f8f9fa; border-radius: 5px; }
         .hidden { display: none; }
         .modal-format { background: #e8f5e8; border: 1px solid #28a745; padding: 15px; border-radius: 5px; margin: 10px 0; }
+        .new-feature { background: #fff3cd; border: 1px solid #ffc107; padding: 15px; border-radius: 5px; margin: 10px 0; }
+        .url-input { width: 100%; padding: 10px; margin: 10px 0; border: 1px solid #ddd; border-radius: 5px; }
     </style>
 </head>
 <body>
     <div class="container">
-        <h1>MAFM OCR API v5.0</h1>
+        <h1>MAFM OCR API v5.1</h1>
         <p>Upload PDF or image files for text extraction with Modal Hunyuan integration.</p>
+        
+        <div class="new-feature">
+            <h3>🆕 URL Support Added!</h3>
+            <p>You can now process files directly from URLs without downloading them first.</p>
+            <p><strong>Example:</strong> <code>POST /extract?file_url=https://example.com/document.pdf</code></p>
+        </div>
         
         <div class="modal-format">
             <h3>✅ Modal Integration Ready</h3>
             <p>This OCR system outputs the exact format needed for your Hunyuan translation system.</p>
-            <p><strong>Endpoint:</strong> <code>/extract-for-modal</code></p>
+            <p><strong>Endpoints:</strong></p>
+            <ul>
+                <li><code>/extract</code> - Basic extraction (supports file upload or URL)</li>
+                <li><code>/extract-for-modal</code> - Modal-specific format (supports file upload or URL)</li>
+            </ul>
         </div>
         
         <div class="upload-area" id="uploadArea">
             <p>Drag and drop files here or click to select</p>
             <input type="file" id="fileInput" accept=".pdf,.png,.jpg,.jpeg,.tiff,.bmp" multiple>
             <button class="btn" onclick="document.getElementById('fileInput').click()">Select Files</button>
+        </div>
+        
+        <div>
+            <h3>Or Process from URL:</h3>
+            <input type="text" class="url-input" id="urlInput" placeholder="Enter file URL (e.g., https://example.com/document.pdf)">
+            <button class="btn" onclick="processUrl()">Process URL</button>
         </div>
         
         <div>
@@ -605,6 +857,69 @@ async def main():
         
         function handleFiles(files) {
             Array.from(files).forEach(file => processFile(file));
+        }
+        
+        function processUrl() {
+            const url = document.getElementById('urlInput').value.trim();
+            if (!url) {
+                alert('Please enter a URL');
+                return;
+            }
+            
+            const fileId = Date.now() + '_' + Math.random().toString(36).substr(2, 9);
+            const verificationLevel = document.getElementById('verificationLevel').value;
+            const filename = url.split('/').pop().split('?')[0] || 'document.pdf';
+            
+            const resultDiv = document.createElement('div');
+            resultDiv.className = 'result';
+            resultDiv.innerHTML = `
+                <h3>${filename} (from URL)</h3>
+                <div class="progress">
+                    <div class="progress-bar" id="progress-${fileId}"></div>
+                </div>
+                <div id="status-${fileId}">Starting...</div>
+                <div id="text-${fileId}" class="hidden"></div>
+            `;
+            results.appendChild(resultDiv);
+            
+            const formData = new FormData();
+            formData.append('file_url', url);
+            formData.append('file_id', fileId);
+            formData.append('verification_level', verificationLevel);
+            
+            fetch('/stream-extract', {
+                method: 'POST',
+                body: formData
+            }).then(response => {
+                if (!response.ok) {
+                    throw new Error('Network response was not ok');
+                }
+                const reader = response.body.getReader();
+                
+                function readStream() {
+                    reader.read().then(({ done, value }) => {
+                        if (done) return;
+                        
+                        const text = new TextDecoder().decode(value);
+                        const lines = text.split('\n');
+                        
+                        lines.forEach(line => {
+                            if (line.startsWith('data: ')) {
+                                try {
+                                    const data = JSON.parse(line.substring(6));
+                                    updateProgress(fileId, data);
+                                } catch (e) {}
+                            }
+                        });
+                        
+                        readStream();
+                    });
+                }
+                
+                readStream();
+            }).catch(error => {
+                document.getElementById(`status-${fileId}`).innerHTML = `❌ Error: ${error.message}`;
+            });
         }
         
         function processFile(file) {
@@ -686,139 +1001,6 @@ async def main():
 </body>
 </html>"""
 
-@app.post("/extract")
-async def extract_text(file: UploadFile = File(...)):
-    """
-    Simple text extraction from PDF or image files.
-    
-    Returns extracted text with basic metadata.
-    """
-    # Check file size
-    content = await file.read()
-    if len(content) > MAX_FILE_SIZE:
-        raise HTTPException(status_code=413, detail=f"File too large. Maximum size is {MAX_FILE_SIZE/1024/1024}MB")
-    
-    temp_file_path = None
-    try:
-        # Save to temp file
-        with tempfile.NamedTemporaryFile(delete=False, suffix=os.path.splitext(file.filename)[1]) as temp_file:
-            temp_file.write(content)
-            temp_file_path = temp_file.name
-        
-        # Clear content from memory
-        content = None
-        gc.collect()
-        
-        if file.filename.lower().endswith('.pdf'):
-            # Process page by page
-            all_text = []
-            
-            # Get page count
-            from pdf2image import pdfinfo_from_path
-            info = pdfinfo_from_path(temp_file_path)
-            total_pages = info['Pages']
-            
-            # Process in chunks
-            chunk_size = 5
-            for chunk_start in range(0, total_pages, chunk_size):
-                chunk_end = min(chunk_start + chunk_size, total_pages)
-                
-                images = pdf2image.convert_from_path(
-                    temp_file_path,
-                    dpi=150,
-                    first_page=chunk_start + 1,
-                    last_page=chunk_end
-                )
-                
-                for i, image in enumerate(images, chunk_start + 1):
-                    text = pytesseract.image_to_string(image)
-                    if text.strip():
-                        all_text.append(f"[Page {i}]\n{text}")
-                    
-                    # Clear image
-                    image.close()
-                    image = None
-                
-                # Clear chunk
-                for img in images:
-                    if img:
-                        img.close()
-                images.clear()
-                del images
-                gc.collect()
-            
-            final_text = "\n\n".join(all_text)
-            pages = total_pages
-            all_text.clear()
-        else:
-            image = Image.open(temp_file_path)
-            final_text = pytesseract.image_to_string(image)
-            pages = 1
-            image.close()
-            image = None
-        
-        # Clean the text for JSON safety
-        cleaned_text = clean_text_for_json(final_text)
-        
-        # Detect the actual language using fast method
-        detected_language = detect_language_from_text(cleaned_text)
-        
-        gc.collect()
-        
-        return JSONResponse({
-            "text": cleaned_text,
-            "pages": pages,
-            "filename": file.filename,
-            "character_count": len(cleaned_text),
-            "language_detection": detected_language
-        })
-        
-    except Exception as e:
-        raise HTTPException(status_code=400, detail=str(e))
-    finally:
-        # Always cleanup temp file
-        if temp_file_path and os.path.exists(temp_file_path):
-            try:
-                os.remove(temp_file_path)
-            except:
-                pass
-        gc.collect()
-
-@app.post("/stream-extract")
-async def stream_extract(
-    file: UploadFile = File(...), 
-    file_id: str = None,
-    verification_level: str = Form('low')
-):
-    """
-    Stream text extraction with real-time progress and multi-pass verification.
-    
-    CURRENT VERIFICATION LEVELS:
-    - low: 1 pass (single extraction for speed)
-    - medium: 2 passes (extract + verify)
-    - high: 3 passes (extract + 2 verify)  
-    - ultra: 4 passes (extract + 3 verify)
-    """
-    # Check file size
-    content = await file.read()
-    if len(content) > MAX_FILE_SIZE:
-        raise HTTPException(status_code=413, detail=f"File too large. Maximum size is {MAX_FILE_SIZE/1024/1024}MB")
-    
-    file_id = file_id or str(uuid.uuid4())
-    
-    if verification_level not in ['low', 'medium', 'high', 'ultra']:
-        verification_level = 'low'
-    
-    return StreamingResponse(
-        stream_ocr_progress(content, file.filename, file_id, verification_level),
-        media_type="text/event-stream",
-        headers={
-            "Cache-Control": "no-cache",
-            "Connection": "keep-alive",
-            "X-Accel-Buffering": "no"
-        }
-    )
-
 @app.get("/api/results")
 async def list_results():
     """Get list of all processed documents"""
@@ -887,9 +1069,10 @@ gc_thread.start()
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 8080))
-    print(f"Starting server with Modal integration...")
+    print(f"Starting server with Modal integration and URL support...")
     print(f"Max file size: {MAX_FILE_SIZE/1024/1024}MB")
     print(f"Max stored results: {MAX_RESULTS}")
     print(f"Verification levels: low=1 pass, medium=2 passes, high=3 passes, ultra=4 passes")
+    print(f"NEW: URL support added - all endpoints can now accept file_url parameter")
     print(f"NEW: /extract-for-modal endpoint - outputs format for Hunyuan processing")
     uvicorn.run(app, host="0.0.0.0", port=port, log_level="info")
